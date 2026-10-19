@@ -258,9 +258,13 @@ function watchUrl(tmdbId, mediaType, season, episode) {
 }
 
 /**
- * Extraction sources, used only when direct = true. frameXTV's own player
- * calls this same worker; a plugin can only match that where CORS does not
- * apply.
+ * Real extraction sources. This is the primary path: frameXTV's stream API
+ * returns direct HLS playlists (4K/1080p/720p) behind a CDN proxy that DOES
+ * send `Access-Control-Allow-Origin: *`, so the QuickJS sandbox can fetch them
+ * and Nuvio's player can play them.
+ *
+ * The /embed/ URL is kept as a last-resort fallback only: it is an HTML page,
+ * so a native player (mpv) rejects it with "unrecognized file format".
  */
 function directSources(tmdbId, mediaType, season, episode, meta) {
   var url = API_BASE + "/api/stream?" + qs({
@@ -275,22 +279,54 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
   return timedFetch(url)
     .then(readJson)
     .then(function (d) {
-      var srcs = (d && d.sources) || [];
+      if (!d) return [];
+      var srcs = (d.sources || []);
       var out = [];
+
       for (var i = 0; i < srcs.length; i++) {
         var s = srcs[i];
         if (!s || !s.url) continue;
+
+        // Subtitle tracks may sit on the source or on the payload root.
+        var subs = [];
+        var raw = s.subtitles || d.subtitles || [];
+        for (var k = 0; k < raw.length; k++) {
+          var t = raw[k];
+          if (t && t.url) {
+            subs.push({
+              url: t.url,
+              lang: t.lang || t.language || t.label || "Unknown"
+            });
+          }
+        }
+
         out.push({
           name: "frameXTV",
-          title: s.server || "frameXTV",
+          title: "frameXTV \u2022 " + (s.quality || "Auto") +
+            (s.server ? " \u2022 " + s.server : ""),
           url: s.url,
-          quality: s.quality || "Unknown",
+          quality: s.quality || "Auto",
           size: "Unknown",
           headers: HEADERS,
-          subtitles: []
+          subtitles: subs
         });
       }
-      return out;
+
+      // Highest quality first.
+      out.sort(function (a, b) {
+        return qualityRank(b.quality) - qualityRank(a.quality);
+      });
+
+      // De-duplicate identical URLs (multi-audio variants repeat the same HLS).
+      var seen = {};
+      var deduped = [];
+      for (var j = 0; j < out.length; j++) {
+        if (!seen[out[j].url]) {
+          seen[out[j].url] = true;
+          deduped.push(out[j]);
+        }
+      }
+      return deduped;
     })
     .catch(function () {
       return [];
@@ -352,48 +388,41 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
       var label = type === "tv" ? "S" + season + "E" + episode : ctx.meta.year || "Movie";
 
-      var streams = [
-        {
-          name: "frameXTV",
-          title: "frameXTV — " + label,
-          url: embedUrl(ctx.id, type, season, episode),
-          quality: "Auto",
-          size: "Unknown",
-          headers: HEADERS,
-          subtitles: [],
-          behaviorHints: { notWebReady: false }
-        },
-        {
-          name: "frameXTV",
-          title: "frameXTV page — " + label,
-          url: watchUrl(ctx.id, type, season, episode),
-          quality: "Auto",
-          size: "Unknown",
-          headers: HEADERS,
-          subtitles: [],
-          behaviorHints: { notWebReady: false }
+      // Primary path: direct HLS playlists from the extraction API. These play
+      // natively and expose real quality/size.
+      return directSources(ctx.id, type, season, episode, ctx.meta).then(function (direct) {
+        if (direct.length) return direct;
+
+        // Extraction returned nothing playable. Only offer the embed page when
+        // we have positive evidence the title exists (the availability check
+        // already returned, so reaching here means "unknown", not "no"). An
+        // HTML page cannot be decoded by a native player, so this is a
+        // best-effort fallback rather than a usable stream.
+        if (getStreams.offerEmbedFallback) {
+          return [
+            {
+              name: "frameXTV",
+              title: "frameXTV \u2022 " + label + " (page)",
+              url: embedUrl(ctx.id, type, season, episode),
+              quality: "Auto",
+              size: "Unknown",
+              headers: HEADERS,
+              subtitles: [],
+              behaviorHints: { notWebReady: true }
+            }
+          ];
         }
-      ];
-
-      if (getStreams.direct) {
-        return directSources(ctx.id, type, season, episode, ctx.meta).then(function (direct) {
-          var merged = direct.concat(streams);
-          merged.sort(function (a, b) {
-            return qualityRank(b.quality) - qualityRank(a.quality);
-          });
-          return merged;
-        });
-      }
-
-      return streams;
+        return [];
+      });
     })
     .catch(function () {
       return [];
     });
 }
 
-getStreams.direct = false;
+getStreams.direct = true;
 getStreams.lenient = false;
+getStreams.offerEmbedFallback = false;
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
