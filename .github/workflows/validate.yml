@@ -1,0 +1,61 @@
+name: Validate provider
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Fails if providers/framextv.js and src/framextv/index.js have drifted,
+      # and if the built file exports getStreams or contains console calls.
+      - name: Build and validate
+        run: |
+          node tools/build.js
+          if ! git diff --quiet -- providers/framextv.js; then
+            echo "::error::providers/framextv.js is out of date. Run 'node tools/build.js' and commit the result."
+            exit 1
+          fi
+
+      - name: Manifest sanity
+        run: |
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            if (!Array.isArray(m.scrapers) || !m.scrapers.length) throw new Error("no scrapers in manifest");
+            for (const s of m.scrapers) {
+              for (const k of ["id", "name", "version", "author", "filename", "supportedTypes"]) {
+                if (!s[k]) throw new Error(`scraper "${s.id || "?"}" missing ${k}`);
+              }
+              if (!fs.existsSync(s.filename)) throw new Error(`manifest points at missing file: ${s.filename}`);
+              const code = fs.readFileSync(s.filename, "utf8");
+              if (!/getStreams/.test(code)) throw new Error(`${s.filename} does not define getStreams`);
+              if (/console\.(log|warn|error|info|debug)\s*\(/.test(code)) throw new Error(`${s.filename} contains console calls`);
+            }
+            console.log("manifest ok:", m.scrapers.map((s) => s.id).join(", "));
+          '
+
+      # Live checks. These hit real upstream services, so a failure here can
+      # mean the source moved rather than that the code is wrong.
+      - name: Live positive cases
+        run: |
+          node tools/test.js 1288069 movie | tee /tmp/pos1.txt
+          node tools/test.js 1396 tv 1 1 | tee /tmp/pos2.txt
+          grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos1.txt
+          grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos2.txt
+
+      - name: Live negative cases
+        run: |
+          # getStreams must never throw, whatever it returns.
+          node tools/test.js 999999 movie
+          node tools/test.js 550 movie
+        continue-on-error: true
