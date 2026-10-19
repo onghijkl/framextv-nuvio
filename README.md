@@ -14,10 +14,16 @@ do not support them.
 
 1. Open Nuvio → **Settings → Content & Discovery → Plugins**
 2. **Add Repository**
-3. Paste the raw manifest URL for this repo:
+3. Paste the raw manifest URL for this repo (Codeberg):
 
    ```
-   https://raw.githubusercontent.com/<your-user>/<your-repo>/main/manifest.json
+   https://codeberg.org/<your-user>/framextv-nuvio/raw/branch/main/manifest.json
+   ```
+
+   On GitHub the equivalent is:
+
+   ```
+   https://raw.githubusercontent.com/<your-user>/framextv-nuvio/main/manifest.json
    ```
 
 4. Refresh the provider list, then **enable** `frameXTV`.
