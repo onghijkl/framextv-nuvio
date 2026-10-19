@@ -29,8 +29,14 @@ Setup:
 
 1. <https://dash.cloudflare.com> → **Workers & Pages** → **Create application**
 2. Connect the Git repository, pick **`framextv-nuvio`**
-3. Leave the **build output directory** at the default (the repository root).
-   Do not point it at `addon/`.
+3. Set the **build output directory** to:
+
+   ```
+   addon
+   ```
+
+   This is required. `_worker.js` must sit in the output directory, and it
+   lives in `addon/`.
 4. Deploy
 
 Addon URL:
