@@ -23,7 +23,7 @@
  * (that one is the Nuvio *plugin* registry, a different thing entirely).
  */
 
-import worker from "./worker.js";
+import worker from "./addon/worker.js";
 
 export default {
   async fetch(request, env) {

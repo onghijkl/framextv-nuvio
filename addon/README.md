@@ -10,24 +10,58 @@ Cinemeta) — it does not replace it.
 
 ---
 
-## Deploy (5 minutes, free, no card)
+## Deploy (free, no card)
 
-1. Sign in / sign up at <https://dash.cloudflare.com> (free plan)
-2. In the sidebar: **Workers & Pages** → **Create** → **Create Worker**
-3. Give it a name, e.g. `pvrplay-catalogs` → **Deploy**
-4. Click **Edit code**
-5. **Delete everything** in the editor and paste the whole of
-   [`worker.js`](./worker.js)
-6. **Deploy** (top right)
+There are two ways. **Route A is what this repository is currently set up for.**
 
-Your addon URL is then:
+### Route A — Cloudflare Pages (connected to this repo)
+
+Cloudflare's "Create application → connect a Git repository" flow creates a
+**Pages** project, not a Worker. Pages serves a repository as static files; it
+runs code only from a `_worker.js` placed in the project's **output directory**.
+
+That is why [`_worker.js`](../_worker.js) lives at the **repository root**: the
+Pages output directory is the repo root, so that file is picked up
+automatically and takes over every request. It serves the addon routes and
+forwards everything else to `env.ASSETS`.
+
+Setup:
+
+1. <https://dash.cloudflare.com> → **Workers & Pages** → **Create application**
+2. Connect the Git repository, pick **`framextv-nuvio`**
+3. Leave the **build output directory** at the default (the repository root).
+   Do not point it at `addon/`.
+4. Deploy
+
+Addon URL:
 
 ```
-https://pvrplay-catalogs.<your-subdomain>.workers.dev/manifest.json
+https://pvrplay-catalogs.pages.dev/manifest.json
 ```
 
-`<your-subdomain>` is shown on the Worker's page. You can also just open the
-`*.workers.dev` URL in a browser — you should see the manifest JSON.
+Use the bare production domain. A `https://<hash>.pvrplay-catalogs.pages.dev`
+URL is a per-commit *preview* and will change on every push.
+
+### Route B — Cloudflare Worker
+
+`wrangler.toml` at the repository root is already configured for this
+(`main = "addon/worker.js"`), so a Worker can be deployed from the same repo
+with no build step.
+
+1. Create a **Worker** (not Pages) and connect the repository, or run
+   `npx wrangler deploy` locally
+2. URL becomes `https://pvrplay-catalogs.<subdomain>.workers.dev/manifest.json`
+
+Either way, open the URL in a browser first — you should see JSON beginning
+`{"id":"org.ong.pvrplay.catalogs"`. If you instead see `{"name":"ong's Repo"`,
+the deployment is serving the repository as static files and the `_worker.js`
+is not being executed.
+
+### Route C — paste into the dashboard (no Git)
+
+1. **Create application** → pick a simple **Worker** template → **Deploy**
+2. **Edit code** → select all, delete, paste [`worker.js`](./worker.js)
+3. **Deploy**
 
 ### Install in Nuvio
 
