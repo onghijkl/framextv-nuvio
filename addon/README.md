@@ -20,8 +20,8 @@ Cloudflare's "Create application → connect a Git repository" flow creates a
 **Pages** project, not a Worker. Pages serves a repository as static files; it
 runs code only from a `_worker.js` placed in the project's **output directory**.
 
-That is why [`_worker.js`](../_worker.js) lives at the **repository root**: the
-Pages output directory is the repo root, so that file is picked up
+That is why [`_worker.js`](./_worker.js) lives in this directory: the
+Pages output directory must be set to `addon`, so that file is picked up
 automatically and takes over every request. It serves the addon routes and
 forwards everything else to `env.ASSETS`.
 
