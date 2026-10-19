@@ -344,76 +344,67 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
       });
     })
     .then(function (ctx) {
-      if (!ctx) return [];
-
-      var title = ctx.meta.title || "";
-
-      // No TMDB metadata means no title to check; fall back to the requested
-      // id rather than refusing to return anything.
-      if (!title) {
-        return streamAvailability(ctx.id, type, season, episode, ctx.meta).then(
-          function (avail) {
-            if (avail === "no") return [];
-            return { id: ctx.id, meta: ctx.meta };
-          }
-        );
-      }
-
-      return searchIndexMatch(title, ctx.meta.year, type).then(function (hit) {
-        var targetId = ctx.id;
-
-        // The index knows frameXTV's own id for this title. If it disagrees
-        // with the requested one, the index wins only when the title matches
-        // exactly — which searchIndexMatch has already enforced.
-        if (hit && hit.id) targetId = String(hit.id);
-
-        var notIndexed = !hit && !getStreams.lenient;
-        return streamAvailability(targetId, type, season, episode, ctx.meta).then(
-          function (avail) {
-            if (avail === "no") return [];
-            // Indexed nowhere and extraction is undecided: stay quiet rather
-            // than offer a stream that will not play.
-            if (notIndexed && avail !== "yes") return [];
-            return { id: targetId, meta: ctx.meta };
-          }
-        );
-      });
-    })
-    .then(function (ctx) {
       if (!ctx || !ctx.id) return [];
 
+      var title = ctx.meta.title || "";
       var label = type === "tv" ? "S" + season + "E" + episode : ctx.meta.year || "Movie";
 
-      // Primary path: direct HLS playlists from the extraction API. These play
-      // natively and expose real quality/size.
-      return directSources(ctx.id, type, season, episode, ctx.meta).then(function (direct) {
+      // Run the search-index lookup and the extraction concurrently.
+      // streamAvailability() used to duplicate this exact API call, costing a
+      // full round-trip for information the extraction already provides.
+      var indexLookup = title
+        ? searchIndexMatch(title, ctx.meta.year, type)
+        : Promise.resolve(null);
+
+      return Promise.all([
+        indexLookup,
+        directSources(ctx.id, type, season, episode, ctx.meta)
+      ]).then(function (both) {
+        var hit = both[0];
+        var direct = both[1];
+
+        // Extraction returned playable sources: done, no further checks needed.
         if (direct.length) return direct;
 
-        // Extraction returned nothing playable. Only offer the embed page when
-        // we have positive evidence the title exists (the availability check
-        // already returned, so reaching here means "unknown", not "no"). An
-        // HTML page cannot be decoded by a native player, so this is a
-        // best-effort fallback rather than a usable stream.
-        if (getStreams.offerEmbedFallback) {
-          return [
-            {
-              name: "frameXTV",
-              title: "frameXTV \u2022 " + label + " (page)",
-              url: embedUrl(ctx.id, type, season, episode),
-              quality: "Auto",
-              size: "Unknown",
-              headers: HEADERS,
-              subtitles: [],
-              behaviorHints: { notWebReady: true }
-            }
-          ];
+        // Nothing extractable. Fall back to the id the index knows, in case
+        // frameXTV files the title under a different one than TMDB does.
+        var targetId = hit && hit.id ? String(hit.id) : ctx.id;
+        if (targetId !== ctx.id) {
+          return directSources(targetId, type, season, episode, ctx.meta).then(function (alt) {
+            if (alt.length) return alt;
+            return embedFallback(targetId, label, type, season, episode);
+          });
         }
-        return [];
+
+        // Indexed nowhere and nothing extractable: stay quiet rather than
+        // offer a stream that will not play.
+        if (!hit && !getStreams.lenient) return [];
+        return embedFallback(ctx.id, label, type, season, episode);
       });
     })
     .catch(function () {
       return [];
     });
+}
+
+/**
+ * The embed page is HTML, so a native player rejects it. Kept behind a flag
+ * (off by default) purely so callers can still be handed something.
+ */
+function embedFallback(id, label, type, season, episode) {
+  if (!getStreams.offerEmbedFallback) return [];
+  return [
+    {
+      name: "frameXTV",
+      title: "frameXTV \u2022 " + label + " (page)",
+      url: embedUrl(id, type, season, episode),
+      quality: "Auto",
+      size: "Unknown",
+      headers: HEADERS,
+      subtitles: [],
+      behaviorHints: { notWebReady: true }
+    }
+  ];
 }
 
 getStreams.direct = true;

@@ -230,22 +230,27 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
 }
 
 /**
- * Fan out across the extractors. The site does the same in parallel; here
- * they run sequentially with early exit so a good first answer is not delayed
- * by the slow ones.
+ * Fan out across the extractors, in parallel. The site does the same.
+ *
+ * Timing matters here: cinemaos usually answers in ~1.7s while vidrift can
+ * take 7s+ and still return nothing. Running them sequentially meant a slow
+ * miss could delay a fast hit. Racing them all and taking the best answer
+ * costs one round-trip instead of four.
  */
 function extract(tmdbId, mediaType, season, episode, meta) {
-  var index = 0;
-  var found = [];
-  var seen = {};
+  var pending = EXTRACTORS.map(function (ep) {
+    return tryExtractor(ep, tmdbId, mediaType, season, episode, meta);
+  });
 
-  function step() {
-    if (index >= EXTRACTORS.length) return Promise.resolve(found);
-    var ep = EXTRACTORS[index++];
-    return tryExtractor(ep, tmdbId, mediaType, season, episode, meta).then(function (s) {
-      if (s && s.url && !seen[s.url]) {
+  return Promise.all(pending)
+    .then(function (results) {
+      var seen = {};
+      var out = [];
+      for (var i = 0; i < results.length; i++) {
+        var s = results[i];
+        if (!s || !s.url || seen[s.url]) continue;
         seen[s.url] = true;
-        found.push({
+        out.push({
           name: "PvrPlay",
           title: "PvrPlay \u2022 " + (s.quality || "Auto") +
             (s.scraperName ? " \u2022 " + s.scraperName : "") +
@@ -257,14 +262,6 @@ function extract(tmdbId, mediaType, season, episode, meta) {
           subtitles: []
         });
       }
-      // One solid source is enough; stop hammering their API.
-      if (found.length) return found;
-      return step();
-    });
-  }
-
-  return step()
-    .then(function (out) {
       out.sort(function (a, b) {
         return qualityRank(b.quality) - qualityRank(a.quality);
       });
