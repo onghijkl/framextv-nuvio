@@ -1,25 +1,33 @@
 {
-  "name": "frameXTV Repo",
-  "version": "1.0.0",
-  "description": "frameXTV streams for Nuvio",
+  "name": "ong's Repo",
+  "version": "1.1.0",
+  "description": "Stream providers for Nuvio",
   "author": "ong",
   "scrapers": [
     {
       "id": "framextv",
       "name": "frameXTV",
-      "description": "frameXTV streams for movies and series, multi-provider extraction with automatic failover",
-      "version": "1.0.0",
+      "description": "frameXTV streams for movies and series. Direct HLS up to 4K, multi-provider extraction with automatic failover.",
+      "version": "1.1.0",
       "author": "ong",
       "filename": "providers/framextv.js",
       "supportedTypes": ["movie", "tv"],
       "contentLanguage": ["en"],
       "logo": "https://framextv.xyz/icon-192.png",
-      "supportedPlatforms": ["ios", "android"],
-      "disabledPlatforms": [],
-      "manifestEnabled": true,
-      "supportsExternalPlayer": false,
-      "limited": false,
-      "formats": ["m3u8"],
+      "formats": ["m3u8", "mp4"],
+      "enabled": true
+    },
+    {
+      "id": "pvrplay",
+      "name": "PvrPlay",
+      "description": "PvrPlay streams for movies and series via its extraction pipeline. HLS, MP4 and DASH sources.",
+      "version": "1.0.0",
+      "author": "ong",
+      "filename": "providers/pvrplay.js",
+      "supportedTypes": ["movie", "tv"],
+      "contentLanguage": ["en", "hi"],
+      "logo": "https://pvrplay.fun/pvrplay-icon.png",
+      "formats": ["m3u8", "mp4", "mpd"],
       "enabled": true
     }
   ]
