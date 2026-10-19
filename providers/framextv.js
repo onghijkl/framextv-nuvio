@@ -1,6 +1,6 @@
 /**
  * framextv - built from src/framextv/index.js
- * Generated: 2026-10-19T13:17:55.260Z
+ * Regenerate with: node tools/build.js
  */
 /**
  * frameXTV provider for Nuvio (Local Scraper / plugin format)

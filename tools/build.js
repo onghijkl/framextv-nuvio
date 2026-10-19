@@ -27,11 +27,13 @@ function stripConsole(code) {
     .join("\n");
 }
 
+// No timestamp: a build that changes on every run would make CI's
+// "is providers/ in sync with src/" check fail permanently.
 function banner() {
   return (
     "/**\n" +
     " * framextv - built from src/framextv/index.js\n" +
-    " * Generated: " + new Date().toISOString() + "\n" +
+    " * Regenerate with: node tools/build.js\n" +
     " */\n"
   );
 }
