@@ -36,6 +36,9 @@ var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 7000;
 var FILTER_BASE = "https://pvrplay-catalogs.pages.dev";
 var VALIDATE_TIMEOUT_MS = 3500;
+// How long to keep gathering sources after the first one arrives. Each extractor
+// can carry a different audio language, so a short wait is worth it.
+var COLLECT_WINDOW_MS = 1500;
 
 var HEADERS = {
   "User-Agent":
@@ -248,7 +251,8 @@ function prepareSource(s) {
               "&cap=" + (getStreams.maxHeight || 1080),
             quality: s.quality,
             scraperName: s.scraperName,
-            label: s.label
+            label: s.label,
+            tracks: s.tracks
           };
         }
         return s;
@@ -301,7 +305,9 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
           quality: best.quality,
           scraperName: best.scraperName,
           label: best.label,
-          type: best.type
+          type: best.type,
+          // Keep the subtitle tracks; dropping them here would lose them.
+          tracks: best.tracks
         };
       }
       return best;
@@ -320,33 +326,41 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
  * costs one round-trip instead of four.
  */
 function extract(tmdbId, mediaType, season, episode, meta) {
-  // The extractors need only id and type; title/year/imdb are optional. Fire
-  // them all at once and take the first usable answer rather than waiting for
-  // every extractor — several reliably return nothing, and one of those being
-  // slow used to delay the result.
+  // The extractors need only id and type; title/year/imdb are optional.
+  //
+  // Collect from EVERY extractor rather than stopping at the first answer.
+  // Each extractor can carry a different audio language, so returning early —
+  // as this used to — threw away the other languages the site's own player
+  // offers. A short collection window keeps a slow straggler from delaying the
+  // result: once one source has arrived, the rest get a bounded grace period.
   return new Promise(function (resolve) {
     var pending = EXTRACTORS.length;
-    var finished = false;
     var results = [];
+    var finished = false;
+    var window = null;
 
     function finish() {
       if (finished) return;
       finished = true;
+      if (window) clearTimeout(window);
       resolve(results);
     }
 
+    function collect(s) {
+      pending--;
+      if (s && s.url) {
+        results.push(s);
+        if (!window) window = setTimeout(finish, COLLECT_WINDOW_MS);
+      }
+      if (pending === 0) finish();
+    }
+
     EXTRACTORS.forEach(function (ep) {
-      tryExtractor(ep, tmdbId, mediaType, season, episode, meta).then(function (s) {
-        pending--;
-        if (s && s.url) {
-          results.push(s);
-          return finish(); // one usable answer is enough to proceed
-        }
-        if (pending === 0) finish();
-      }).catch(function () {
-        pending--;
-        if (pending === 0) finish();
-      });
+      tryExtractor(ep, tmdbId, mediaType, season, episode, meta)
+        .then(collect)
+        .catch(function () {
+          collect(null);
+        });
     });
   }).then(function (valid) {
     if (!valid.length) return [];
@@ -364,6 +378,18 @@ function extract(tmdbId, mediaType, season, episode, meta) {
         var s = prepared[i];
         if (!s || !s.url || seen[s.url]) continue;
         seen[s.url] = true;
+        // tracks carry the subtitle renditions the player would otherwise
+        // get; the URL is relative to the player origin.
+        var subs = [];
+        var tr = s.tracks || [];
+        for (var ti = 0; ti < tr.length; ti++) {
+          var tk = tr[ti];
+          if (!tk || !tk.url) continue;
+          subs.push({
+            url: tk.url.indexOf("http") === 0 ? tk.url : PLAYER + tk.url,
+            lang: tk.lang || tk.label || "Unknown"
+          });
+        }
         out.push({
           name: "ongserv2",
           title: "ongserv2 \u2022 " + (s.quality || "Auto") +
@@ -373,7 +399,7 @@ function extract(tmdbId, mediaType, season, episode, meta) {
           quality: s.quality || "Auto",
           size: "Unknown",
           headers: HEADERS,
-          subtitles: []
+          subtitles: subs
         });
       }
       out.sort(function (a, b) {
