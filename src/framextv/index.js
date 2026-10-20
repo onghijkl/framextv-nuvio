@@ -33,12 +33,12 @@
 var SITE = "https://framextv.xyz";
 var API_BASE = "https://api.framextv.tech";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
-var TIMEOUT_MS = 12000;
+var TIMEOUT_MS = 6500;
 // Playlist filter (the Cloudflare Worker in addon/) — caps resolution and
 // strips HEVC while preserving the separate audio rendition.
 var FILTER_BASE = "https://pvrplay-catalogs.pages.dev";
 // Dead sources are dropped fast so the player is not kept waiting.
-var VALIDATE_TIMEOUT_MS = 5000;
+var VALIDATE_TIMEOUT_MS = 3500;
 
 var HEADERS = {
   "User-Agent":
@@ -406,19 +406,29 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
         });
       }
 
-      // Validate in parallel: the added latency is one round-trip rather than
-      // one per source, and dead entries never reach the player.
-      var checks = candidates.map(function (c) {
-        return prepareSource({ url: c.url, type: c._type });
-      });
+      // Validate in parallel. Resolve as soon as one source is good rather than
+      // waiting on every check, so a slow or dead entry cannot hold up the
+      // whole result.
+      var checks = [];
+      for (var ci = 0; ci < candidates.length; ci++) {
+        (function (idx) {
+          checks.push(
+            prepareSource({ url: candidates[idx].url, type: candidates[idx]._type }).then(
+              function (p) {
+                return p ? { idx: idx, url: p.url } : null;
+              }
+            )
+          );
+        })(ci);
+      }
 
-      return Promise.all(checks).then(function (prepared) {
+      return settleFast(checks, 1, 700).then(function (prepared) {
         var out = [];
         var seen = {};
 
         for (var j = 0; j < prepared.length; j++) {
           if (!prepared[j]) continue;
-          var item = candidates[j];
+          var item = candidates[prepared[j].idx];
           item.url = prepared[j].url;
           delete item._type;
           if (seen[item.url]) continue;
@@ -437,6 +447,46 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
     });
 }
 
+/**
+ * Resolve as soon as enough sources have validated, instead of waiting for
+ * every check. A single dead source used to hold up the whole result for the
+ * full validation timeout, even when another source had already come back good.
+ *
+ *   minSources — how many good sources to gather before starting the grace timer
+ *   graceMs    — how long to keep collecting after that, so near-simultaneous
+ *                results still get included
+ */
+function settleFast(promises, minSources, graceMs) {
+  return new Promise(function (resolve) {
+    var good = [];
+    var settled = 0;
+    var timer = null;
+    var finished = false;
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      resolve(good);
+    }
+
+    if (!promises.length) return finish();
+
+    promises.forEach(function (p) {
+      p.then(function (v) {
+        settled++;
+        if (v) good.push(v);
+        if (settled === promises.length) return finish();
+        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
+      }).catch(function () {
+        settled++;
+        if (settled === promises.length) return finish();
+        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
+      });
+    });
+  });
+}
+
 /* ------------------------------------------------------------------ entry */
 
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
@@ -444,50 +494,40 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   var season = parseInt(seasonNum, 10) || 1;
   var episode = parseInt(episodeNum, 10) || 1;
 
-  return resolveTmdbId(tmdbId, type)
-    .then(function (id) {
-      if (!id) return null;
-      return tmdbMeta(id, type).then(function (meta) {
-        return { id: id, meta: meta || {} };
-      });
-    })
-    .then(function (ctx) {
-      if (!ctx || !ctx.id) return [];
+  var idPromise = resolveTmdbId(tmdbId, type);
 
-      var title = ctx.meta.title || "";
-      var label = type === "tv" ? "S" + season + "E" + episode : ctx.meta.year || "Movie";
+  // The extraction API needs only id and type, so start it immediately and let
+  // the TMDB lookup run alongside it rather than in front of it. That removes a
+  // full round-trip from the common path.
+  var extractionPromise = idPromise.then(function (id) {
+    if (!id) return { id: null, sources: [] };
+    return directSources(id, type, season, episode, {}).then(function (s) {
+      return { id: id, sources: s };
+    });
+  });
 
-      // Run the search-index lookup and the extraction concurrently.
-      // streamAvailability() used to duplicate this exact API call, costing a
-      // full round-trip for information the extraction already provides.
-      var indexLookup = title
-        ? searchIndexMatch(title, ctx.meta.year, type)
-        : Promise.resolve(null);
+  var metaPromise = idPromise.then(function (id) {
+    if (!id) return null;
+    return tmdbMeta(id, type);
+  });
 
-      return Promise.all([
-        indexLookup,
-        directSources(ctx.id, type, season, episode, ctx.meta)
-      ]).then(function (both) {
-        var hit = both[0];
-        var direct = both[1];
+  return Promise.all([extractionPromise, metaPromise])
+    .then(function (both) {
+      var ext = both[0] || {};
+      var meta = both[1] || {};
 
-        // Extraction returned playable sources: done, no further checks needed.
-        if (direct.length) return direct;
+      // Extraction returning sources is the strongest evidence the title is
+      // carried, so no index lookup is needed in that case.
+      if (ext.sources && ext.sources.length) return ext.sources;
 
-        // Nothing extractable. Fall back to the id the index knows, in case
-        // frameXTV files the title under a different one than TMDB does.
-        var targetId = hit && hit.id ? String(hit.id) : ctx.id;
-        if (targetId !== ctx.id) {
-          return directSources(targetId, type, season, episode, ctx.meta).then(function (alt) {
-            if (alt.length) return alt;
-            return embedFallback(targetId, label, type, season, episode);
-          });
-        }
-
-        // Indexed nowhere and nothing extractable: stay quiet rather than
-        // offer a stream that will not play.
-        if (!hit && !getStreams.lenient) return [];
-        return embedFallback(ctx.id, label, type, season, episode);
+      // Nothing playable. Consult the index to find the id frameXTV files this
+      // title under, then try once more.
+      var title = meta.title || "";
+      if (!title) return [];
+      return searchIndexMatch(title, meta.year, type).then(function (hit) {
+        if (!hit || !hit.id) return [];
+        if (String(hit.id) === String(ext.id)) return [];
+        return directSources(String(hit.id), type, season, episode, meta);
       });
     })
     .catch(function () {

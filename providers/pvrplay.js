@@ -33,9 +33,9 @@
 var PLAYER = "https://embed.reelsdownload.online";
 var SITE = "https://pvrplay.fun";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
-var TIMEOUT_MS = 15000;
+var TIMEOUT_MS = 7000;
 var FILTER_BASE = "https://pvrplay-catalogs.pages.dev";
-var VALIDATE_TIMEOUT_MS = 5000;
+var VALIDATE_TIMEOUT_MS = 3500;
 
 var HEADERS = {
   "User-Agent":
@@ -320,51 +320,104 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
  * costs one round-trip instead of four.
  */
 function extract(tmdbId, mediaType, season, episode, meta) {
-  // Validate + reduce to a playable variant before anything reaches the player.
-  var pending = EXTRACTORS.map(function (ep) {
-    return tryExtractor(ep, tmdbId, mediaType, season, episode, meta);
-  });
+  // The extractors need only id and type; title/year/imdb are optional. Fire
+  // them all at once and take the first usable answer rather than waiting for
+  // every extractor — several reliably return nothing, and one of those being
+  // slow used to delay the result.
+  return new Promise(function (resolve) {
+    var pending = EXTRACTORS.length;
+    var finished = false;
+    var results = [];
 
-  return Promise.all(pending)
-    .then(function (results) {
-      var valid = results.filter(function (s) {
-        return s && s.url;
-      });
+    function finish() {
+      if (finished) return;
+      finished = true;
+      resolve(results);
+    }
 
-      // Validate each in parallel, then reduce to a playable variant.
-      var checks = valid.map(function (s) {
-        return prepareSource(s);
-      });
-
-      return Promise.all(checks).then(function (prepared) {
-        var seen = {};
-        var out = [];
-        for (var i = 0; i < prepared.length; i++) {
-          if (!prepared[i] || !prepared[i].url) continue;
-          var s = prepared[i];
-          if (seen[s.url]) continue;
-          seen[s.url] = true;
-          out.push({
-            name: "ongserv2",
-            title: "ongserv2 \u2022 " + (s.quality || "Auto") +
-              (s.scraperName ? " \u2022 " + s.scraperName : "") +
-              (s.label ? " \u2022 " + s.label : ""),
-            url: s.url,
-            quality: s.quality || "Auto",
-            size: "Unknown",
-            headers: HEADERS,
-            subtitles: []
-          });
+    EXTRACTORS.forEach(function (ep) {
+      tryExtractor(ep, tmdbId, mediaType, season, episode, meta).then(function (s) {
+        pending--;
+        if (s && s.url) {
+          results.push(s);
+          return finish(); // one usable answer is enough to proceed
         }
-        out.sort(function (a, b) {
-          return qualityRank(b.quality) - qualityRank(a.quality);
-        });
-        return out;
+        if (pending === 0) finish();
+      }).catch(function () {
+        pending--;
+        if (pending === 0) finish();
       });
-    })
-    .catch(function () {
-      return [];
     });
+  }).then(function (valid) {
+    if (!valid.length) return [];
+
+    var checks = valid.map(function (s) {
+      return prepareSource(s).then(function (p) {
+        return p && p.url ? p : null;
+      });
+    });
+
+    return settleFast(checks, 1, 700).then(function (prepared) {
+      var seen = {};
+      var out = [];
+      for (var i = 0; i < prepared.length; i++) {
+        var s = prepared[i];
+        if (!s || !s.url || seen[s.url]) continue;
+        seen[s.url] = true;
+        out.push({
+          name: "ongserv2",
+          title: "ongserv2 \u2022 " + (s.quality || "Auto") +
+            (s.scraperName ? " \u2022 " + s.scraperName : "") +
+            (s.label ? " \u2022 " + s.label : ""),
+          url: s.url,
+          quality: s.quality || "Auto",
+          size: "Unknown",
+          headers: HEADERS,
+          subtitles: []
+        });
+      }
+      out.sort(function (a, b) {
+        return qualityRank(b.quality) - qualityRank(a.quality);
+      });
+      return out;
+    });
+  });
+}
+
+/**
+ * Resolve as soon as one source has validated, instead of waiting for every
+ * check. A single dead source used to hold up the result for the full timeout
+ * even when another had already come back good.
+ */
+function settleFast(promises, minSources, graceMs) {
+  return new Promise(function (resolve) {
+    var good = [];
+    var settled = 0;
+    var timer = null;
+    var finished = false;
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      resolve(good);
+    }
+
+    if (!promises.length) return finish();
+
+    promises.forEach(function (p) {
+      p.then(function (v) {
+        settled++;
+        if (v) good.push(v);
+        if (settled === promises.length) return finish();
+        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
+      }).catch(function () {
+        settled++;
+        if (settled === promises.length) return finish();
+        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
+      });
+    });
+  });
 }
 
 /* ------------------------------------------------------------------ entry */
@@ -376,14 +429,11 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
   return resolveTmdbId(tmdbId, type)
     .then(function (id) {
-      if (!id) return null;
-      return tmdbMeta(id, type).then(function (meta) {
-        return { id: id, meta: meta || { title: "" } };
-      });
-    })
-    .then(function (ctx) {
-      if (!ctx) return [];
-      return extract(ctx.id, type, season, episode, ctx.meta);
+      if (!id) return [];
+      // The extractors need only id and type — title, year and imdb are
+      // optional and ignored in practice. Skipping the TMDB lookup removes a
+      // round-trip from every request.
+      return extract(id, type, season, episode, {});
     })
     .catch(function () {
       return [];
