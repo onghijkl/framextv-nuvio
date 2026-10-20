@@ -33,52 +33,39 @@ const UA =
 /**
  * Catalog definitions.
  *
- *   src   — "pvrplay" (default) or "tmdb"
- *   path  — PvrPlay page to read            (pvrplay only)
- *   key   — array name in the RSC payload   (pvrplay only)
- *   query — TMDB discover params            (tmdb only)
+ *   src   — "home" (PvrPlay home screen), "pvrplay" (a page), or "tmdb"
+ *   row   — exact row title on the home screen   (home only)
+ *   path  — PvrPlay page to read                 (pvrplay only)
+ *   key   — array name in the RSC payload        (pvrplay only)
+ *   query — TMDB discover params                 (tmdb only)
  *   types — which Stremio types this row serves
  *
- * PvrPlay itself has no Hindi section and no language filter, so the Hindi rows
- * are sourced from TMDB instead. Both stream providers carry Hindi audio, so
- * most titles still resolve — but a Hindi row is not guaranteed playable the
- * way the PvrPlay rows are.
+ * The home rows mirror PvrPlay's own home screen exactly: its homepage payload
+ * carries every row as {"items":[...TMDB objects...],"title":"Row Name"}, so a
+ * single fetch yields all of them.
  */
 const CATALOGS = [
-  { id: "pvr-trending", path: "/trending", key: "initialItems", name: "PvrPlay Trending", types: ["movie", "series"] },
+  // --- PvrPlay home screen, row for row ---
+  { id: "home-coming-soon", src: "home", row: "Coming Soon", name: "Coming Soon", types: ["movie"] },
+  { id: "home-in-theatres", src: "home", row: "In Theatres", name: "In Theatres", types: ["movie"] },
+  { id: "home-netflix", src: "home", row: "Trending on Netflix", name: "Trending on Netflix", types: ["movie"] },
+  { id: "home-hotstar", src: "home", row: "Popular on Hotstar", name: "Popular on Hotstar", types: ["series"] },
+  { id: "home-prime", src: "home", row: "Popular on Prime Video", name: "Popular on Prime Video", types: ["movie", "series"] },
+  { id: "home-trending", src: "home", row: "Trending Now", name: "Trending Now", types: ["movie", "series"] },
+  { id: "home-new", src: "home", row: "New Releases", name: "New Releases", types: ["movie", "series"] },
+
+  // --- browse pages ---
   { id: "pvr-movies", path: "/movies", key: "initialMovies", name: "PvrPlay Movies", types: ["movie"] },
   { id: "pvr-tvshows", path: "/tv-shows", key: "initialShows", name: "PvrPlay TV Shows", types: ["series"] },
-  { id: "pvr-netflix", path: "/platform/8", key: "initialItems", name: "PvrPlay Netflix", types: ["movie"] },
-  { id: "pvr-prime", path: "/platform/9", key: "initialItems", name: "PvrPlay Prime Video", types: ["movie"] },
-  { id: "pvr-disney", path: "/platform/337", key: "initialItems", name: "PvrPlay Disney+", types: ["movie"] },
-  { id: "pvr-appletv", path: "/platform/350", key: "initialItems", name: "PvrPlay Apple TV+", types: ["movie"] },
-  { id: "pvr-hulu", path: "/platform/15", key: "initialItems", name: "PvrPlay Hulu", types: ["movie"] },
-  { id: "pvr-max", path: "/platform/1899", key: "initialItems", name: "PvrPlay Max", types: ["movie"] },
-  { id: "pvr-paramount", path: "/platform/531", key: "initialItems", name: "PvrPlay Paramount+", types: ["movie"] },
   { id: "pvr-shudder", path: "/platform/99", key: "initialItems", name: "PvrPlay Shudder", types: ["movie"] },
 
-  // Hindi rows — sourced from TMDB, since PvrPlay exposes no Hindi listing.
-  {
-    id: "hi-movies",
-    src: "tmdb",
-    query: { with_original_language: "hi", sort_by: "popularity.desc" },
-    name: "Hindi Movies",
-    types: ["movie"]
-  },
-  {
-    id: "hi-movies-top",
-    src: "tmdb",
-    query: { with_original_language: "hi", sort_by: "vote_count.desc" },
-    name: "Hindi Movies \u2022 Most Voted",
-    types: ["movie"]
-  },
-  {
-    id: "hi-tvshows",
-    src: "tmdb",
-    query: { with_original_language: "hi", sort_by: "popularity.desc" },
-    name: "Hindi TV Shows",
-    types: ["series"]
-  }
+  // --- Hindi rows. PvrPlay exposes no Hindi listing and its genre pages are
+  // client-rendered, so these come from TMDB discover instead. Providers carry
+  // Hindi audio so most resolve, but unlike the PvrPlay rows they are not
+  // guaranteed playable.
+  { id: "hi-movies", src: "tmdb", query: { with_original_language: "hi", sort_by: "popularity.desc" }, name: "Hindi Movies", types: ["movie"] },
+  { id: "hi-movies-top", src: "tmdb", query: { with_original_language: "hi", sort_by: "vote_count.desc" }, name: "Hindi Movies \u2022 Most Voted", types: ["movie"] },
+  { id: "hi-tvshows", src: "tmdb", query: { with_original_language: "hi", sort_by: "popularity.desc" }, name: "Hindi TV Shows", types: ["series"] }
 ];
 
 /** Public TMDB key — the same one the source sites embed in their clients. */
@@ -315,11 +302,88 @@ function manifest() {
   };
 }
 
+/** Extract one balanced JSON array starting at `start`. */
+function balancedArray(text, start) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === "[") depth++;
+    else if (c === "]") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return { arr: JSON.parse(text.slice(start, i + 1)), end: i };
+        } catch (e) {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Read every row off the PvrPlay home screen.
+ *
+ * The homepage payload carries each row as {"items":[...],"title":"Row Name"},
+ * so one fetch yields all of them — no per-row request, and the rows match the
+ * site exactly.
+ */
+function parseHomeRows(payload) {
+  const out = [];
+  let idx = 0;
+  while (true) {
+    const at = payload.indexOf('"items":[', idx);
+    if (at < 0) break;
+    const start = payload.indexOf("[", at);
+    const b = balancedArray(payload, start);
+    if (!b) {
+      idx = at + 9;
+      continue;
+    }
+    const tail = payload.slice(b.end, b.end + 400);
+    const tm = tail.match(/"title":"([^"]{2,50})"/);
+    if (tm && b.arr.length) out.push({ title: tm[1], items: b.arr });
+    idx = b.end;
+  }
+  return out;
+}
+
 async function catalog(type, id) {
   const def = CATALOGS.find(function (c) {
     return c.id === id;
   });
   if (!def) return { metas: [] };
+
+  // Rows lifted from the PvrPlay home screen.
+  if (def.src === "home") {
+    const r = await fetch(PVR_BASE + "/", {
+      headers: { "User-Agent": UA, Accept: "text/html" },
+      cf: { cacheTtl: 900, cacheEverything: true }
+    });
+    if (!r.ok) return { metas: [] };
+    const rows = parseHomeRows(rscPayload(await r.text()));
+    const row = rows.find(function (x) {
+      return x.title === def.row;
+    });
+    if (!row) return { metas: [] };
+
+    const metas = [];
+    for (const o of row.items) {
+      if (!o || !o.id) continue;
+      const series = isSeries(o);
+      if (type === "series" && !series) continue;
+      if (type === "movie" && series) continue;
+      metas.push(toMeta(o));
+    }
+    return { metas: metas };
+  }
 
   // TMDB-backed rows (the Hindi ones).
   if (def.src === "tmdb") {
