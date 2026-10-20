@@ -165,42 +165,6 @@ function yearsClose(a, b, tol) {
 }
 
 /**
- * The site's search index covers all of TMDB, so a search hit alone proves
- * nothing about frameXTV's library. The decisive test is whether a stream can
- * be extracted for this exact id.
- *
- * Observed API shapes (Oct 2026):
- *   in library     -> {"success":true,"provider":"miner","sources":[...]}
- *   not in library -> {"success":false,"error":"TMDB returned HTTP 404"}
- *   undecided      -> {"success":true,"sources":[]}
- *
- * Returns "yes" | "no" | "unknown". "unknown" must not block the result —
- * a transient API failure should not hide a title frameXTV does carry.
- */
-function streamAvailability(tmdbId, mediaType, season, episode, meta) {
-  var url = API_BASE + "/api/stream?" + qs({
-    id: tmdbId,
-    type: mediaType,
-    season: mediaType === "tv" ? season : undefined,
-    episode: mediaType === "tv" ? episode : undefined,
-    title: meta.title,
-    year: meta.year,
-    imdb_id: meta.imdbId
-  });
-  return timedFetch(url)
-    .then(readJson)
-    .then(function (d) {
-      if (!d) return "unknown";
-      if (d.success === false) return "no";
-      if (d.sources && d.sources.length > 0) return "yes";
-      return "unknown";
-    })
-    .catch(function () {
-      return "unknown";
-    });
-}
-
-/**
  * Search the site index, both to corroborate that frameXTV indexes this title
  * and to recover the id it actually uses. Exact title match only — a substring
  * match is far too loose ("Fight Club" also hits "Jurassic Fight Club").
@@ -253,14 +217,6 @@ function embedUrl(tmdbId, mediaType, season, episode) {
     base += "/" + (season || 1) + "/" + (episode || 1);
   }
   return base + "?" + qs({ autoplay: 1, origin: "internal" });
-}
-
-function watchUrl(tmdbId, mediaType, season, episode) {
-  var base = SITE + "/watch/" + tmdbId;
-  if (mediaType === "tv") {
-    base += "/" + (season || 1) + "/" + (episode || 1);
-  }
-  return base;
 }
 
 /** Resolve a possibly-relative URL against a base. */
@@ -539,29 +495,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
     });
 }
 
-/**
- * The embed page is HTML, so a native player rejects it. Kept behind a flag
- * (off by default) purely so callers can still be handed something.
- */
-function embedFallback(id, label, type, season, episode) {
-  if (!getStreams.offerEmbedFallback) return [];
-  return [
-    {
-      name: "ongserv1",
-      title: "ongserv1 \u2022 " + label + " (page)",
-      url: embedUrl(id, type, season, episode),
-      quality: "Auto",
-      size: "Unknown",
-      headers: HEADERS,
-      subtitles: [],
-      behaviorHints: { notWebReady: true }
-    }
-  ];
-}
-
 getStreams.direct = true;
-getStreams.lenient = false;
-getStreams.offerEmbedFallback = false;
 getStreams.maxHeight = 1080;
 getStreams.filterBase = FILTER_BASE;
 

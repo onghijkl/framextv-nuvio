@@ -55,8 +55,9 @@ const CATALOGS = [
   { id: "home-new", src: "home", row: "New Releases", name: "New Releases", types: ["movie", "series"] },
 
   // --- browse pages ---
-  { id: "pvr-movies", path: "/movies", key: "initialMovies", name: "PvrPlay Movies", types: ["movie"] },
-  { id: "pvr-tvshows", path: "/tv-shows", key: "initialShows", name: "PvrPlay TV Shows", types: ["series"] },
+  { id: "pvr-movies", path: "/movies", key: "initialMovies", name: "PvrPlay Movies", types: ["movie"], search: true },
+  { id: "pvr-tvshows", path: "/tv-shows", key: "initialShows", name: "PvrPlay TV Shows", types: ["series"], search: true },
+  { id: "pvr-tamil", path: "/tamil-blasters", key: "initialMovies", name: "Tamil / Telugu", types: ["movie"] },
   { id: "pvr-shudder", path: "/platform/99", key: "initialItems", name: "PvrPlay Shudder", types: ["movie"] },
 
   // --- Hindi rows. PvrPlay exposes no Hindi listing and its genre pages are
@@ -286,15 +287,20 @@ function manifest() {
   const catalogs = [];
   for (const c of CATALOGS) {
     for (const t of c.types) {
-      catalogs.push({ type: t, id: c.id, name: c.name });
+      const entry = { type: t, id: c.id, name: c.name };
+      // Declaring the search extra is what makes a catalog searchable — without
+      // it the client never offers a search field for the row.
+      if (c.search) entry.extra = [{ name: "search", isRequired: false }];
+      catalogs.push(entry);
     }
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.0.0",
+    version: "1.3.0",
     name: "PvrPlay Catalogs",
+    logo: PVR_BASE + "/pvrplay-icon.png",
     description:
-      "Home-screen rows from PvrPlay. Every title listed is one PvrPlay carries.",
+      "Home-screen rows from PvrPlay, mirroring the site. Every title listed is one PvrPlay carries.",
     resources: [{ name: "catalog", types: ["movie", "series"] }],
     types: ["movie", "series"],
     idPrefixes: ["tmdb:"],
@@ -355,11 +361,41 @@ function parseHomeRows(payload) {
   return out;
 }
 
-async function catalog(type, id) {
+/**
+ * Search PvrPlay directly. The site's own search returns complete TMDB objects
+ * under `initialResults`, so results match what the site would show.
+ */
+async function searchPvrPlay(query, type) {
+  const r = await fetch(PVR_BASE + "/search?q=" + encodeURIComponent(query), {
+    headers: { "User-Agent": UA, Accept: "text/html" },
+    cf: { cacheTtl: 600, cacheEverything: true }
+  });
+  if (!r.ok) return { metas: [] };
+
+  const items = extractArray(rscPayload(await r.text()), "initialResults");
+  if (!items) return { metas: [] };
+
+  const metas = [];
+  for (const o of items) {
+    if (!o || !o.id) continue;
+    const series = isSeries(o);
+    if (type === "series" && !series) continue;
+    if (type === "movie" && series) continue;
+    metas.push(toMeta(o));
+  }
+  return { metas: metas };
+}
+
+async function catalog(type, id, extra) {
   const def = CATALOGS.find(function (c) {
     return c.id === id;
   });
   if (!def) return { metas: [] };
+
+  // A search on a searchable catalog goes straight to PvrPlay's own search.
+  if (extra && extra.search) {
+    return searchPvrPlay(extra.search, type);
+  }
 
   // Rows lifted from the PvrPlay home screen.
   if (def.src === "home") {
@@ -416,13 +452,28 @@ async function catalog(type, id) {
   if (!items) return { metas: [] };
 
   const metas = [];
-  for (const o of items) {
-    if (!o || !o.id) continue;
+  for (const raw of items) {
+    if (!raw) continue;
+    // Some PvrPlay pages (e.g. /tamil-blasters) key the item as tmdb_id rather
+    // than id, and carry a display title with the year and audio languages
+    // already appended.
+    const o = Object.assign({}, raw);
+    if (!o.id && o.tmdb_id) o.id = o.tmdb_id;
+    if (!o.id) continue;
+
     const series = isSeries(o);
     // Only surface rows matching the type the client asked for.
     if (type === "series" && !series) continue;
     if (type === "movie" && series) continue;
-    metas.push(toMeta(o));
+
+    const meta = toMeta(o);
+    // "Minions & Monsters (2026) [Tam + Eng]" -> drop the redundant year, the
+    // row already shows it, but keep the language tag as it is useful.
+    meta.name = String(meta.name)
+      .replace(/\s*\((19|20)\d{2}\)\s*/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    metas.push(meta);
   }
   return { metas: metas };
 }
@@ -461,12 +512,23 @@ export default {
         });
       }
 
-      // /catalog/<type>/<id>.json  or  /catalog/<type>/<id>/<extra>.json
-      const m = path.match(/^\/catalog\/([^/]+)\/([^/]+?)(?:\/[^/]*)?\.json$/);
+      // /catalog/<type>/<id>.json
+      // /catalog/<type>/<id>/<extra>.json   where extra is e.g. search=avatar
+      //                                     or genre=Action&skip=100
+      const m = path.match(/^\/catalog\/([^/]+)\/([^/]+?)(?:\/(.+?))?\.json$/);
       if (m) {
         const type = decodeURIComponent(m[1]);
         const id = decodeURIComponent(m[2]);
-        const data = await catalog(type, id);
+        const extra = {};
+        if (m[3]) {
+          for (const part of m[3].split("&")) {
+            const eq = part.indexOf("=");
+            if (eq > 0) {
+              extra[decodeURIComponent(part.slice(0, eq))] = decodeURIComponent(part.slice(eq + 1));
+            }
+          }
+        }
+        const data = await catalog(type, id, extra);
         return cors(JSON.stringify(data));
       }
 
