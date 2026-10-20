@@ -112,7 +112,7 @@ function tmdbMeta(tmdbId, mediaType) {
   var url =
     "https://api.themoviedb.org/3/" + type + "/" + tmdbId +
     "?api_key=" + TMDB_API_KEY + "&append_to_response=external_ids";
-  return timedFetch(url)
+  return hedgedFetch(url, TIMEOUT_MS, 2000)
     .then(readJson)
     .then(function (d) {
       if (!d) return null;
@@ -305,6 +305,45 @@ function prepareSource(s) {
       return null; // dead or too slow — do not offer it
     });
 }
+
+/**
+ * Fire a second identical request if the first has not answered quickly, and
+ * take whichever succeeds first.
+ *
+ * The frameXTV API intermittently stalls: measured directly, one call hangs for
+ * 10s+ while an immediate retry returns in 0.6-1.5s. Waiting out the stall is
+ * what makes this provider feel slow. Hedging turns that tail latency into a
+ * second request rather than a long wait.
+ */
+function hedgedFetch(url, ms, hedgeAfterMs) {
+  return new Promise(function (resolve, reject) {
+    var settled = false;
+    var failures = 0;
+
+    function run() {
+      timedFetch(url, null, ms)
+        .then(function (r) {
+          if (settled) return;
+          settled = true;
+          resolve(r);
+        })
+        .catch(function (e) {
+          failures++;
+          if (!settled && failures >= 2) {
+            settled = true;
+            reject(e);
+          }
+        });
+    }
+
+    run();
+    setTimeout(function () {
+      if (!settled) run();
+    }, hedgeAfterMs);
+  });
+}
+
+/** One extractor call. Returns a normalized stream, or null. */
 
 /**
  * Real extraction sources. This is the primary path: frameXTV's stream API
