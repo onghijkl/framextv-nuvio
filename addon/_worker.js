@@ -34,6 +34,7 @@ export default {
     const isAddonRoute =
       path === "/" ||
       path === "/manifest.json" ||
+      path === "/hls" ||
       /^\/catalog\/[^/]+\/[^/]+?(?:\/[^/]*)?\.json$/.test(path);
 
     if (isAddonRoute) {
