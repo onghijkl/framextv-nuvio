@@ -34,6 +34,7 @@ var PLAYER = "https://embed.reelsdownload.online";
 var SITE = "https://pvrplay.fun";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 15000;
+var VALIDATE_TIMEOUT_MS = 5000;
 
 var HEADERS = {
   "User-Agent":
@@ -181,6 +182,97 @@ function resolveTmdbId(tmdbId, mediaType) {
 
 /* ------------------------------------------------------------- extraction */
 
+/** Resolve a possibly-relative URL against a base. */
+function absUrl(base, rel) {
+  if (rel.indexOf("http://") === 0 || rel.indexOf("https://") === 0) return rel;
+  var m = base.match(/^(https?:\/\/[^\/]+)/);
+  var origin = m ? m[1] : "";
+  if (rel.charAt(0) === "/") return origin + rel;
+  return base.substring(0, base.lastIndexOf("/") + 1) + rel;
+}
+
+/**
+ * Pick a playable variant from an HLS master playlist.
+ *
+ * These ladders put 4K HEVC (hvc1) at the highest bandwidth, and HLS clients
+ * select by bandwidth — so the player picks 4K HEVC, fails to decode the video,
+ * and plays audio only. Choosing here stops that happening.
+ *
+ * Returns null when the text is not a master playlist.
+ */
+function chooseVariant(text, baseUrl) {
+  var lines = text.split("\n");
+  var variants = [];
+
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    var next = (lines[i + 1] || "").trim();
+    if (!next || next.charAt(0) === "#") continue;
+
+    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+
+    variants.push({
+      height: res ? parseInt(res[2], 10) : 0,
+      hevc: /hvc1|hev1/i.test(cod),
+      bw: bw,
+      url: absUrl(baseUrl, next)
+    });
+  }
+
+  if (!variants.length) return null;
+
+  var cap = getStreams.maxHeight || 1080;
+  var ok = variants.filter(function (v) {
+    return !v.hevc && (!v.height || v.height <= cap);
+  });
+  if (!ok.length) {
+    ok = variants.filter(function (v) {
+      return !v.hevc;
+    });
+  }
+  if (!ok.length) {
+    ok = variants.filter(function (v) {
+      return !v.height || v.height <= cap;
+    });
+  }
+  if (!ok.length) ok = variants;
+
+  ok.sort(function (a, b) {
+    return b.bw - a.bw;
+  });
+  return ok[0].url;
+}
+
+/**
+ * Validate a source and reduce it to something playable: drop what does not
+ * answer, and for HLS return a single suitable variant instead of the master.
+ * Returns the adjusted source, or null to discard.
+ */
+function prepareSource(s) {
+  var isHls =
+    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("ios-hls") !== -1;
+
+  if (!isHls) return Promise.resolve(s);
+
+  return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
+    .then(function (r) {
+      if (!r || !r.ok) return null;
+      return r.text().then(function (t) {
+        if (t.indexOf("#EXTM3U") === -1) return s;
+        if (t.indexOf("#EXT-X-STREAM-INF") === -1 && t.indexOf("#EXTINF") === -1) return null;
+        var chosen = chooseVariant(t, s.url);
+        if (!chosen) return s;
+        return { url: chosen, quality: s.quality, scraperName: s.scraperName, label: s.label };
+      });
+    })
+    .catch(function () {
+      return null;
+    });
+}
+
 /** One extractor call. Returns a normalized stream, or null. */
 function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
   var params = {
@@ -242,34 +334,47 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
  * costs one round-trip instead of four.
  */
 function extract(tmdbId, mediaType, season, episode, meta) {
+  // Validate + reduce to a playable variant before anything reaches the player.
   var pending = EXTRACTORS.map(function (ep) {
     return tryExtractor(ep, tmdbId, mediaType, season, episode, meta);
   });
 
   return Promise.all(pending)
     .then(function (results) {
-      var seen = {};
-      var out = [];
-      for (var i = 0; i < results.length; i++) {
-        var s = results[i];
-        if (!s || !s.url || seen[s.url]) continue;
-        seen[s.url] = true;
-        out.push({
-          name: "PvrPlay",
-          title: "PvrPlay \u2022 " + (s.quality || "Auto") +
-            (s.scraperName ? " \u2022 " + s.scraperName : "") +
-            (s.label ? " \u2022 " + s.label : ""),
-          url: s.url,
-          quality: s.quality || "Auto",
-          size: "Unknown",
-          headers: HEADERS,
-          subtitles: []
-        });
-      }
-      out.sort(function (a, b) {
-        return qualityRank(b.quality) - qualityRank(a.quality);
+      var valid = results.filter(function (s) {
+        return s && s.url;
       });
-      return out;
+
+      // Validate each in parallel, then reduce to a playable variant.
+      var checks = valid.map(function (s) {
+        return prepareSource(s);
+      });
+
+      return Promise.all(checks).then(function (prepared) {
+        var seen = {};
+        var out = [];
+        for (var i = 0; i < prepared.length; i++) {
+          if (!prepared[i] || !prepared[i].url) continue;
+          var s = prepared[i];
+          if (seen[s.url]) continue;
+          seen[s.url] = true;
+          out.push({
+            name: "PvrPlay",
+            title: "PvrPlay \u2022 " + (s.quality || "Auto") +
+              (s.scraperName ? " \u2022 " + s.scraperName : "") +
+              (s.label ? " \u2022 " + s.label : ""),
+            url: s.url,
+            quality: s.quality || "Auto",
+            size: "Unknown",
+            headers: HEADERS,
+            subtitles: []
+          });
+        }
+        out.sort(function (a, b) {
+          return qualityRank(b.quality) - qualityRank(a.quality);
+        });
+        return out;
+      });
     })
     .catch(function () {
       return [];

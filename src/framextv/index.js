@@ -34,6 +34,8 @@ var SITE = "https://framextv.xyz";
 var API_BASE = "https://api.framextv.tech";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 12000;
+// Dead sources are dropped fast so the player is not kept waiting.
+var VALIDATE_TIMEOUT_MS = 5000;
 
 var HEADERS = {
   "User-Agent":
@@ -69,9 +71,10 @@ function qualityRank(q) {
 }
 
 /** fetch with hard timeout; the runtime gives no AbortController guarantee. */
-function timedFetch(url, opts) {
+function timedFetch(url, opts, ms) {
   var options = opts || {};
   if (!options.headers) options.headers = HEADERS;
+  var limit = ms || TIMEOUT_MS;
   var work = fetch(url, options);
   if (typeof Promise !== "undefined" && Promise.race) {
     return Promise.race([
@@ -79,7 +82,7 @@ function timedFetch(url, opts) {
       new Promise(function (_, reject) {
         setTimeout(function () {
           reject(new Error("timeout"));
-        }, TIMEOUT_MS);
+        }, limit);
       })
     ]);
   }
@@ -253,6 +256,109 @@ function watchUrl(tmdbId, mediaType, season, episode) {
   return base;
 }
 
+/** Resolve a possibly-relative URL against a base. */
+function absUrl(base, rel) {
+  if (rel.indexOf("http://") === 0 || rel.indexOf("https://") === 0) return rel;
+  var m = base.match(/^(https?:\/\/[^\/]+)/);
+  var origin = m ? m[1] : "";
+  if (rel.charAt(0) === "/") return origin + rel;
+  return base.substring(0, base.lastIndexOf("/") + 1) + rel;
+}
+
+/**
+ * Pick a playable variant out of an HLS master playlist.
+ *
+ * Why this exists: upstream ladders put a 4K HEVC (hvc1) rendition at the
+ * highest bandwidth. HLS clients select by bandwidth, so the player picks 4K
+ * HEVC, the device fails to decode it, and you get audio with no picture — and
+ * usually a hung player. Choosing the variant here means the player is never
+ * offered something it cannot decode.
+ *
+ * Preference: H.264 within the height cap, then any H.264, then anything within
+ * the cap, then whatever is left. Returns null when the text is not a master
+ * playlist (a media playlist needs no choosing).
+ */
+function chooseVariant(text, baseUrl) {
+  var lines = text.split("\n");
+  var variants = [];
+
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    var next = (lines[i + 1] || "").trim();
+    if (!next || next.charAt(0) === "#") continue;
+
+    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+
+    variants.push({
+      height: res ? parseInt(res[2], 10) : 0,
+      hevc: /hvc1|hev1/i.test(cod),
+      bw: bw,
+      url: absUrl(baseUrl, next)
+    });
+  }
+
+  if (!variants.length) return null;
+
+  var cap = getStreams.maxHeight || 1080;
+  var ok = variants.filter(function (v) {
+    return !v.hevc && (!v.height || v.height <= cap);
+  });
+  if (!ok.length) {
+    ok = variants.filter(function (v) {
+      return !v.hevc;
+    });
+  }
+  if (!ok.length) {
+    ok = variants.filter(function (v) {
+      return !v.height || v.height <= cap;
+    });
+  }
+  if (!ok.length) ok = variants;
+
+  ok.sort(function (a, b) {
+    return b.bw - a.bw;
+  });
+  return ok[0].url;
+}
+
+/**
+ * Validate one source and reduce it to something playable.
+ *
+ * Two jobs:
+ *   1. Drop sources that do not answer. The upstream API lists sources that are
+ *      simply dead, and handing one to the player is what makes playback sit
+ *      there before falling back.
+ *   2. For HLS, hand back a single suitable variant rather than the master.
+ *
+ * Returns the adjusted source, or null to discard it.
+ */
+function prepareSource(s) {
+  var isHls =
+    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("index-s") !== -1;
+
+  if (!isHls) return Promise.resolve(s);
+
+  return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
+    .then(function (r) {
+      if (!r || !r.ok) return null;
+      return r.text().then(function (t) {
+        if (t.indexOf("#EXTM3U") === -1) return s; // not a playlist; trust it
+        // A playlist with neither variants nor segments is an error page
+        // dressed up as a playlist (CDNs return these for blocked origins).
+        if (t.indexOf("#EXT-X-STREAM-INF") === -1 && t.indexOf("#EXTINF") === -1) return null;
+        var chosen = chooseVariant(t, s.url);
+        if (!chosen) return s; // already a media playlist
+        return { url: chosen, type: s.type };
+      });
+    })
+    .catch(function () {
+      return null; // dead or too slow — do not offer it
+    });
+}
+
 /**
  * Real extraction sources. This is the primary path: frameXTV's stream API
  * returns direct HLS playlists (4K/1080p/720p) behind a CDN proxy that DOES
@@ -277,7 +383,7 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
     .then(function (d) {
       if (!d) return [];
       var srcs = (d.sources || []);
-      var out = [];
+      var candidates = [];
 
       for (var i = 0; i < srcs.length; i++) {
         var s = srcs[i];
@@ -285,9 +391,9 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
 
         // Subtitle tracks may sit on the source or on the payload root.
         var subs = [];
-        var raw = s.subtitles || d.subtitles || [];
-        for (var k = 0; k < raw.length; k++) {
-          var t = raw[k];
+        var subRaw = s.subtitles || d.subtitles || [];
+        for (var k = 0; k < subRaw.length; k++) {
+          var t = subRaw[k];
           if (t && t.url) {
             subs.push({
               url: t.url,
@@ -296,7 +402,7 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
           }
         }
 
-        out.push({
+        candidates.push({
           name: "frameXTV",
           title: "frameXTV \u2022 " + (s.quality || "Auto") +
             (s.server ? " \u2022 " + s.server : ""),
@@ -304,25 +410,36 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
           quality: s.quality || "Auto",
           size: "Unknown",
           headers: HEADERS,
-          subtitles: subs
+          subtitles: subs,
+          _type: s.type
         });
       }
 
-      // Highest quality first.
-      out.sort(function (a, b) {
-        return qualityRank(b.quality) - qualityRank(a.quality);
+      // Validate in parallel: the added latency is one round-trip rather than
+      // one per source, and dead entries never reach the player.
+      var checks = candidates.map(function (c) {
+        return prepareSource({ url: c.url, type: c._type });
       });
 
-      // De-duplicate identical URLs (multi-audio variants repeat the same HLS).
-      var seen = {};
-      var deduped = [];
-      for (var j = 0; j < out.length; j++) {
-        if (!seen[out[j].url]) {
-          seen[out[j].url] = true;
-          deduped.push(out[j]);
+      return Promise.all(checks).then(function (prepared) {
+        var out = [];
+        var seen = {};
+
+        for (var j = 0; j < prepared.length; j++) {
+          if (!prepared[j]) continue;
+          var item = candidates[j];
+          item.url = prepared[j].url;
+          delete item._type;
+          if (seen[item.url]) continue;
+          seen[item.url] = true;
+          out.push(item);
         }
-      }
-      return deduped;
+
+        out.sort(function (a, b) {
+          return qualityRank(b.quality) - qualityRank(a.quality);
+        });
+        return out;
+      });
     })
     .catch(function () {
       return [];
@@ -410,6 +527,7 @@ function embedFallback(id, label, type, season, episode) {
 getStreams.direct = true;
 getStreams.lenient = false;
 getStreams.offerEmbedFallback = false;
+getStreams.maxHeight = 1080;
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
