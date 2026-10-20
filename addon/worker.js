@@ -268,6 +268,94 @@ async function filterPlaylist(target, cap) {
   return out.join("\n");
 }
 
+/**
+ * Serve metadata, including episode lists, so series opened from these rows do
+ * not depend on another addon.
+ *
+ * Why this is needed: catalog items are emitted with `tmdb:` ids. Cinemeta only
+ * understands `tt` ids and returns nothing for those, so unless the TMDB Addon
+ * is installed and active, a series has no metadata source — no episode list —
+ * and it behaves like a single video. Providing meta here removes that
+ * dependency.
+ */
+async function meta(type, rawId) {
+  const id = String(rawId).replace(/^tmdb[:\/]/, "");
+  if (!/^\d+$/.test(id)) return { meta: null };
+
+  const kind = type === "series" ? "tv" : "movie";
+  const base = "https://api.themoviedb.org/3/" + kind + "/" + id;
+  const key = "?api_key=" + TMDB_API_KEY;
+
+  const r = await fetch(base + key, {
+    headers: { Accept: "application/json" },
+    cf: { cacheTtl: 3600, cacheEverything: true }
+  });
+  if (!r.ok) return { meta: null };
+  const d = await r.json();
+
+  const meta = {
+    id: "tmdb:" + id,
+    type: type === "series" ? "series" : "movie",
+    name: (kind === "tv" ? d.name : d.title) || "",
+    description: d.overview || "",
+    poster: d.poster_path ? IMG + d.poster_path : undefined,
+    background: d.backdrop_path ? "https://image.tmdb.org/t/p/w1280" + d.backdrop_path : undefined,
+    releaseInfo: String((kind === "tv" ? d.first_air_date : d.release_date) || "").slice(0, 4),
+    imdbRating: d.vote_average ? String(Math.round(d.vote_average * 10) / 10) : undefined,
+    genres: (d.genres || []).map(function (g) {
+      return g.name;
+    }),
+    runtime: d.episode_run_time && d.episode_run_time.length ? d.episode_run_time[0] + "min" : undefined
+  };
+
+  if (kind !== "tv") return { meta: meta };
+
+  // Episodes. Seasons are fetched in parallel; a show with many seasons costs
+  // one request each, so results are cached for an hour.
+  const seasons = (d.seasons || []).filter(function (s) {
+    return s.season_number > 0;
+  });
+  const wanted = seasons.slice(0, 20);
+
+  const results = await Promise.all(
+    wanted.map(function (s) {
+      return fetch(base + "/season/" + s.season_number + key, {
+        headers: { Accept: "application/json" },
+        cf: { cacheTtl: 3600, cacheEverything: true }
+      })
+        .then(function (x) {
+          return x.ok ? x.json() : null;
+        })
+        .catch(function () {
+          return null;
+        });
+    })
+  );
+
+  const videos = [];
+  for (const season of results) {
+    if (!season || !season.episodes) continue;
+    for (const ep of season.episodes) {
+      if (!ep || ep.episode_number == null) continue;
+      videos.push({
+        id: "tmdb:" + id + ":" + season.season_number + ":" + ep.episode_number,
+        name: ep.name || "Episode " + ep.episode_number,
+        season: season.season_number,
+        episode: ep.episode_number,
+        number: ep.episode_number,
+        overview: ep.overview || undefined,
+        thumbnail: ep.still_path ? "https://image.tmdb.org/t/p/w500" + ep.still_path : undefined,
+        released: ep.air_date || undefined,
+        runtime: ep.runtime ? ep.runtime + "min" : undefined,
+        rating: ep.vote_average ? String(Math.round(ep.vote_average * 10) / 10) : undefined
+      });
+    }
+  }
+
+  if (videos.length) meta.videos = videos;
+  return { meta: meta };
+}
+
 /* ---------------------------------------------------------------- handler */
 
 function cors(body, status) {
@@ -301,7 +389,10 @@ function manifest() {
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
       "Home-screen rows from PvrPlay, mirroring the site. Every title listed is one PvrPlay carries.",
-    resources: [{ name: "catalog", types: ["movie", "series"] }],
+    resources: [
+      { name: "catalog", types: ["movie", "series"] },
+      { name: "meta", types: ["movie", "series"], idPrefixes: ["tmdb:"] }
+    ],
     types: ["movie", "series"],
     idPrefixes: ["tmdb:"],
     catalogs: catalogs
@@ -490,6 +581,13 @@ export default {
     try {
       if (path === "/" || path === "/manifest.json") {
         return cors(JSON.stringify(manifest()));
+      }
+
+      // /meta/<type>/<id>.json
+      const mm = path.match(/^\/meta\/([^/]+)\/(.+?)\.json$/);
+      if (mm) {
+        const data = await meta(decodeURIComponent(mm[1]), decodeURIComponent(mm[2]));
+        return cors(JSON.stringify(data));
       }
 
       // /hls?u=<encoded master playlist>&cap=1080

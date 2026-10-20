@@ -35,6 +35,7 @@ export default {
       path === "/" ||
       path === "/manifest.json" ||
       path === "/hls" ||
+      /^\/meta\/[^/]+\/.+\.json$/.test(path) ||
       /^\/catalog\/[^/]+\/[^/]+?(?:\/[^/]*)?\.json$/.test(path);
 
     if (isAddonRoute) {
