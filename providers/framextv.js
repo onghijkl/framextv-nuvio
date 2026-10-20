@@ -38,6 +38,9 @@ var SITE = "https://framextv.xyz";
 var API_BASE = "https://api.framextv.tech";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 12000;
+// Playlist filter (the Cloudflare Worker in addon/) — caps resolution and
+// strips HEVC while preserving the separate audio rendition.
+var FILTER_BASE = "https://pvrplay-catalogs.pages.dev";
 // Dead sources are dropped fast so the player is not kept waiting.
 var VALIDATE_TIMEOUT_MS = 5000;
 
@@ -269,64 +272,6 @@ function absUrl(base, rel) {
   return base.substring(0, base.lastIndexOf("/") + 1) + rel;
 }
 
-/**
- * Pick a playable variant out of an HLS master playlist.
- *
- * Why this exists: upstream ladders put a 4K HEVC (hvc1) rendition at the
- * highest bandwidth. HLS clients select by bandwidth, so the player picks 4K
- * HEVC, the device fails to decode it, and you get audio with no picture — and
- * usually a hung player. Choosing the variant here means the player is never
- * offered something it cannot decode.
- *
- * Preference: H.264 within the height cap, then any H.264, then anything within
- * the cap, then whatever is left. Returns null when the text is not a master
- * playlist (a media playlist needs no choosing).
- */
-function chooseVariant(text, baseUrl) {
-  var lines = text.split("\n");
-  var variants = [];
-
-  for (var i = 0; i < lines.length; i++) {
-    var l = lines[i].trim();
-    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
-    var next = (lines[i + 1] || "").trim();
-    if (!next || next.charAt(0) === "#") continue;
-
-    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
-    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
-    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-
-    variants.push({
-      height: res ? parseInt(res[2], 10) : 0,
-      hevc: /hvc1|hev1/i.test(cod),
-      bw: bw,
-      url: absUrl(baseUrl, next)
-    });
-  }
-
-  if (!variants.length) return null;
-
-  var cap = getStreams.maxHeight || 1080;
-  var ok = variants.filter(function (v) {
-    return !v.hevc && (!v.height || v.height <= cap);
-  });
-  if (!ok.length) {
-    ok = variants.filter(function (v) {
-      return !v.hevc;
-    });
-  }
-  if (!ok.length) {
-    ok = variants.filter(function (v) {
-      return !v.height || v.height <= cap;
-    });
-  }
-  if (!ok.length) ok = variants;
-
-  ok.sort(function (a, b) {
-    return b.bw - a.bw;
-  });
-  return ok[0].url;
-}
 
 /**
  * Validate one source and reduce it to something playable.
@@ -336,6 +281,45 @@ function chooseVariant(text, baseUrl) {
  *      simply dead, and handing one to the player is what makes playback sit
  *      there before falling back.
  *   2. For HLS, hand back a single suitable variant rather than the master.
+ *
+ * Returns the adjusted source, or null to discard it.
+ */
+/**
+ * Does this master playlist contain anything the device should not be offered?
+ * True when any variant is HEVC or taller than the cap.
+ */
+function needsFilter(text) {
+  var cap = getStreams.maxHeight || 1080;
+  var lines = text.split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i];
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    var h = res ? parseInt(res[2], 10) : 0;
+    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    if (/hvc1|hev1/i.test(cod)) return true;
+    if (h && h > cap) return true;
+  }
+  return false;
+}
+
+/**
+ * Validate one source and reduce it to something playable.
+ *
+ * Three jobs:
+ *   1. Drop sources that do not answer. Upstream lists sources that are simply
+ *      dead, and handing one to the player is what makes playback sit there
+ *      before falling back.
+ *   2. Drop responses that are not really playlists (CDNs return error pages
+ *      with a playlist-ish content type).
+ *   3. When a master advertises HEVC or >cap renditions, route it through the
+ *      playlist filter.
+ *
+ * Note on why the master is not simply replaced by one variant: these ladders
+ * declare audio as a separate rendition (`#EXT-X-MEDIA:TYPE=AUDIO`) referenced
+ * by `AUDIO="..."` on each variant. A variant playlist fetched on its own has no
+ * audio reference, so the result plays silently. The master has to be kept and
+ * filtered instead.
  *
  * Returns the adjusted source, or null to discard it.
  */
@@ -350,12 +334,19 @@ function prepareSource(s) {
       if (!r || !r.ok) return null;
       return r.text().then(function (t) {
         if (t.indexOf("#EXTM3U") === -1) return s; // not a playlist; trust it
-        // A playlist with neither variants nor segments is an error page
-        // dressed up as a playlist (CDNs return these for blocked origins).
-        if (t.indexOf("#EXT-X-STREAM-INF") === -1 && t.indexOf("#EXTINF") === -1) return null;
-        var chosen = chooseVariant(t, s.url);
-        if (!chosen) return s; // already a media playlist
-        return { url: chosen, type: s.type };
+
+        var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
+        if (!isMaster && t.indexOf("#EXTINF") === -1) return null; // empty shell
+
+        if (isMaster && needsFilter(t)) {
+          return {
+            url: (getStreams.filterBase || FILTER_BASE) +
+              "/hls?u=" + encodeURIComponent(s.url) +
+              "&cap=" + (getStreams.maxHeight || 1080),
+            type: s.type
+          };
+        }
+        return s;
       });
     })
     .catch(function () {
@@ -407,8 +398,8 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
         }
 
         candidates.push({
-          name: "frameXTV",
-          title: "frameXTV \u2022 " + (s.quality || "Auto") +
+          name: "ongserv1",
+          title: "ongserv1 \u2022 " + (s.quality || "Auto") +
             (s.server ? " \u2022 " + s.server : ""),
           url: s.url,
           quality: s.quality || "Auto",
@@ -516,8 +507,8 @@ function embedFallback(id, label, type, season, episode) {
   if (!getStreams.offerEmbedFallback) return [];
   return [
     {
-      name: "frameXTV",
-      title: "frameXTV \u2022 " + label + " (page)",
+      name: "ongserv1",
+      title: "ongserv1 \u2022 " + label + " (page)",
       url: embedUrl(id, type, season, episode),
       quality: "Auto",
       size: "Unknown",
@@ -532,6 +523,7 @@ getStreams.direct = true;
 getStreams.lenient = false;
 getStreams.offerEmbedFallback = false;
 getStreams.maxHeight = 1080;
+getStreams.filterBase = FILTER_BASE;
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };

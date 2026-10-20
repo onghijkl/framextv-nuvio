@@ -32,9 +32,17 @@ const UA =
 
 /**
  * Catalog definitions.
- *   path  — PvrPlay page to read
- *   key   — array name inside the RSC payload
+ *
+ *   src   — "pvrplay" (default) or "tmdb"
+ *   path  — PvrPlay page to read            (pvrplay only)
+ *   key   — array name in the RSC payload   (pvrplay only)
+ *   query — TMDB discover params            (tmdb only)
  *   types — which Stremio types this row serves
+ *
+ * PvrPlay itself has no Hindi section and no language filter, so the Hindi rows
+ * are sourced from TMDB instead. Both stream providers carry Hindi audio, so
+ * most titles still resolve — but a Hindi row is not guaranteed playable the
+ * way the PvrPlay rows are.
  */
 const CATALOGS = [
   { id: "pvr-trending", path: "/trending", key: "initialItems", name: "PvrPlay Trending", types: ["movie", "series"] },
@@ -46,8 +54,35 @@ const CATALOGS = [
   { id: "pvr-appletv", path: "/platform/350", key: "initialItems", name: "PvrPlay Apple TV+", types: ["movie"] },
   { id: "pvr-hulu", path: "/platform/15", key: "initialItems", name: "PvrPlay Hulu", types: ["movie"] },
   { id: "pvr-max", path: "/platform/1899", key: "initialItems", name: "PvrPlay Max", types: ["movie"] },
-  { id: "pvr-paramount", path: "/platform/531", key: "initialItems", name: "PvrPlay Paramount+", types: ["movie"] }
+  { id: "pvr-paramount", path: "/platform/531", key: "initialItems", name: "PvrPlay Paramount+", types: ["movie"] },
+  { id: "pvr-shudder", path: "/platform/99", key: "initialItems", name: "PvrPlay Shudder", types: ["movie"] },
+
+  // Hindi rows — sourced from TMDB, since PvrPlay exposes no Hindi listing.
+  {
+    id: "hi-movies",
+    src: "tmdb",
+    query: { with_original_language: "hi", sort_by: "popularity.desc" },
+    name: "Hindi Movies",
+    types: ["movie"]
+  },
+  {
+    id: "hi-movies-top",
+    src: "tmdb",
+    query: { with_original_language: "hi", sort_by: "vote_count.desc" },
+    name: "Hindi Movies \u2022 Most Voted",
+    types: ["movie"]
+  },
+  {
+    id: "hi-tvshows",
+    src: "tmdb",
+    query: { with_original_language: "hi", sort_by: "popularity.desc" },
+    name: "Hindi TV Shows",
+    types: ["series"]
+  }
 ];
+
+/** Public TMDB key — the same one the source sites embed in their clients. */
+const TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 
 /* ------------------------------------------------------------------ parse */
 
@@ -126,6 +161,125 @@ function toMeta(o) {
   return meta;
 }
 
+/* -------------------------------------------------------- playlist filter */
+
+/**
+ * Cap and codec filter for HLS master playlists.
+ *
+ * Why this exists: upstream ladders advertise a 4K HEVC (hvc1) rendition at the
+ * highest bandwidth, and HLS clients select by bandwidth — so players pick a
+ * rendition the device cannot decode and end up with audio and no picture.
+ *
+ * Simply handing the player one chosen variant is not an option: these masters
+ * declare audio as a separate rendition (`#EXT-X-MEDIA:TYPE=AUDIO`) that the
+ * video variants reference via `AUDIO="..."`. A variant playlist fetched on its
+ * own carries no audio reference, so the result plays silently. The master has
+ * to be kept intact and filtered instead.
+ *
+ * Only the small playlist passes through here; segments are fetched by the
+ * player straight from the origin.
+ */
+async function filterPlaylist(target, cap) {
+  const res = await fetch(target, {
+    headers: { "User-Agent": UA },
+    cf: { cacheTtl: 300, cacheEverything: true }
+  });
+  if (!res.ok) return null;
+
+  const text = await res.text();
+  if (text.indexOf("#EXTM3U") === -1) return null;
+  // A media playlist needs no filtering — hand it straight back.
+  if (text.indexOf("#EXT-X-STREAM-INF") === -1) return text;
+
+  const lines = text.split("\n");
+  const base = target;
+
+  const abs = (rel) => {
+    if (/^https?:\/\//i.test(rel)) return rel;
+    const m = base.match(/^(https?:\/\/[^/]+)/);
+    const origin = m ? m[1] : "";
+    return rel.charAt(0) === "/" ? origin + rel : base.slice(0, base.lastIndexOf("/") + 1) + rel;
+  };
+
+  const out = [];
+  const kept = [];
+  const dropped = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Rewrite relative URIs inside EXT-X-MEDIA (the separate audio rendition).
+    // Left relative, the player would resolve them against this Worker's origin
+    // instead of the upstream host, and the audio track would 404.
+    if (line.indexOf("#EXT-X-MEDIA") === 0 && line.indexOf('URI="') !== -1) {
+      out.push(
+        line.replace(/URI="([^"]+)"/, (whole, uri) => 'URI="' + abs(uri) + '"')
+      );
+      continue;
+    }
+
+    if (line.indexOf("#EXT-X-STREAM-INF") !== 0) {
+      out.push(line);
+      continue;
+    }
+
+    const next = (lines[i + 1] || "").trim();
+    if (!next || next.charAt(0) === "#") {
+      out.push(line);
+      continue;
+    }
+
+    const res2 = line.match(/RESOLUTION=(\d+)x(\d+)/);
+    const height = res2 ? parseInt(res2[2], 10) : 0;
+    const codecs = (line.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    const hevc = /hvc1|hev1/i.test(codecs);
+    const tooTall = height && height > cap;
+
+    if (hevc || tooTall) {
+      dropped.push({ index: i });
+      i++; // also skip the URI line
+      continue;
+    }
+
+    kept.push({ index: i });
+    out.push(line);
+    out.push(/^https?:\/\//i.test(next) ? next : abs(next));
+    i++;
+  }
+
+  // Nothing worth removing: return the original untouched.
+  if (!dropped.length) return text;
+
+  // If the cap removes everything, keep the best of what was dropped rather
+  // than returning a playlist the player cannot use. Rebuild from scratch in
+  // that case, since the pass above already emitted the survivors.
+  if (!kept.length) {
+    const rebuilt = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.indexOf("#EXT-X-MEDIA") === 0 && line.indexOf('URI="') !== -1) {
+        rebuilt.push(line.replace(/URI="([^"]+)"/, (w, uri) => 'URI="' + abs(uri) + '"'));
+        continue;
+      }
+      if (line.indexOf("#EXT-X-STREAM-INF") !== 0) {
+        rebuilt.push(line);
+        continue;
+      }
+      const next = (lines[i + 1] || "").trim();
+      if (!next || next.charAt(0) === "#") {
+        rebuilt.push(line);
+        continue;
+      }
+      rebuilt.push(line);
+      rebuilt.push(/^https?:\/\//i.test(next) ? next : abs(next));
+      i++;
+    }
+    return rebuilt.join("\n");
+  }
+
+  return out.join("\n");
+}
+
 /* ---------------------------------------------------------------- handler */
 
 function cors(body, status) {
@@ -167,6 +321,26 @@ async function catalog(type, id) {
   });
   if (!def) return { metas: [] };
 
+  // TMDB-backed rows (the Hindi ones).
+  if (def.src === "tmdb") {
+    const kind = type === "series" ? "tv" : "movie";
+    const params = new URLSearchParams(
+      Object.assign({}, def.query, { api_key: TMDB_API_KEY, page: "1" })
+    );
+    const r = await fetch("https://api.themoviedb.org/3/discover/" + kind + "?" + params, {
+      headers: { Accept: "application/json" },
+      cf: { cacheTtl: 900, cacheEverything: true }
+    });
+    if (!r.ok) return { metas: [] };
+    const data = await r.json();
+    const metas = [];
+    for (const o of data.results || []) {
+      if (!o || !o.id) continue;
+      metas.push(toMeta(Object.assign({}, o, { media_type: kind === "tv" ? "tv" : "movie" })));
+    }
+    return { metas: metas };
+  }
+
   const res = await fetch(PVR_BASE + def.path, {
     headers: { "User-Agent": UA, Accept: "text/html" },
     cf: { cacheTtl: 600, cacheEverything: true }
@@ -201,6 +375,26 @@ export default {
     try {
       if (path === "/" || path === "/manifest.json") {
         return cors(JSON.stringify(manifest()));
+      }
+
+      // /hls?u=<encoded master playlist>&cap=1080
+      if (path === "/hls") {
+        const target = url.searchParams.get("u");
+        const cap = parseInt(url.searchParams.get("cap") || "1080", 10) || 1080;
+        if (!target) return cors(JSON.stringify({ error: "missing u" }), 400);
+
+        const filtered = await filterPlaylist(target, cap);
+        if (filtered === null) {
+          return new Response("upstream playlist unavailable", { status: 502 });
+        }
+        return new Response(filtered, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=300"
+          }
+        });
       }
 
       // /catalog/<type>/<id>.json  or  /catalog/<type>/<id>/<extra>.json
