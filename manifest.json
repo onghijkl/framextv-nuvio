@@ -1,14 +1,14 @@
 {
   "name": "ong's Repo",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Stream providers for Nuvio",
   "author": "ong",
   "scrapers": [
     {
       "id": "framextv",
-      "name": "frameXTV",
-      "description": "frameXTV streams for movies and series. Direct HLS up to 4K, multi-provider extraction with automatic failover.",
-      "version": "1.1.0",
+      "name": "ONGserv1",
+      "description": "Direct HLS up to 4K, multi-provider extraction with automatic failover.",
+      "version": "1.2.0",
       "author": "ong",
       "filename": "providers/framextv.js",
       "supportedTypes": ["movie", "tv"],
@@ -19,9 +19,9 @@
     },
     {
       "id": "pvrplay",
-      "name": "PvrPlay",
-      "description": "PvrPlay streams for movies and series via its extraction pipeline. HLS, MP4 and DASH sources.",
-      "version": "1.0.0",
+      "name": "ONGserv2",
+      "description": "Multi-extractor pipeline. HLS, MP4 and DASH sources.",
+      "version": "1.2.0",
       "author": "ong",
       "filename": "providers/pvrplay.js",
       "supportedTypes": ["movie", "tv"],
