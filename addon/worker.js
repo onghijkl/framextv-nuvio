@@ -279,7 +279,27 @@ async function filterPlaylist(target, cap) {
  * dependency.
  */
 async function meta(type, rawId) {
-  const id = String(rawId).replace(/^tmdb[:\/]/, "");
+  let id = String(rawId).trim();
+
+  // Nuvio converts a tmdb: id to an IMDb id before looking meta up
+  // (resolveMetaLookupId -> TmdbService.tmdbToImdb), so this handler is reached
+  // with either form. Accept both.
+  if (/^tt\d+$/i.test(id)) {
+    const f = await fetch(
+      "https://api.themoviedb.org/3/find/" + id +
+        "?api_key=" + TMDB_API_KEY + "&external_source=imdb_id",
+      { headers: { Accept: "application/json" }, cf: { cacheTtl: 3600, cacheEverything: true } }
+    );
+    if (!f.ok) return { meta: null };
+    const found = await f.json();
+    const list =
+      type === "series" ? found.tv_results : found.movie_results;
+    if (!list || !list.length) return { meta: null };
+    id = String(list[0].id);
+  } else {
+    id = id.replace(/^tmdb[:\/]/, "").split(":")[0];
+  }
+
   if (!/^\d+$/.test(id)) return { meta: null };
 
   const kind = type === "series" ? "tv" : "movie";
@@ -391,7 +411,10 @@ function manifest() {
       "Home-screen rows from PvrPlay, mirroring the site. Every title listed is one PvrPlay carries.",
     resources: [
       { name: "catalog", types: ["movie", "series"] },
-      { name: "meta", types: ["movie", "series"], idPrefixes: ["tmdb:"] }
+      // No idPrefixes here on purpose. Nuvio rewrites a tmdb: id to an IMDb
+      // id before resolving meta, then filters addons by idPrefixes — so
+      // declaring "tmdb:" means this resource is never consulted.
+      { name: "meta", types: ["movie", "series"] }
     ],
     types: ["movie", "series"],
     idPrefixes: ["tmdb:"],
