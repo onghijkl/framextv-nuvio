@@ -387,6 +387,8 @@ function extract(tmdbId, mediaType, season, episode, meta) {
           });
         }
         out.push({
+          _verified: !!s.verified,
+          _latency: s.latencyMs == null ? null : s.latencyMs,
           name: "ongserv2",
           // label carries the audio variant ("Alpha - English") - the
           // 4KHDHub-style detail worth showing.
@@ -400,9 +402,22 @@ function extract(tmdbId, mediaType, season, episode, meta) {
           subtitles: subs
         });
       }
+      // The extractor reports how long it took (latencyMs) and whether the
+      // source was verified. Ordering by those puts the quickest, most
+      // trustworthy source at the top instead of whichever answered first.
       out.sort(function (a, b) {
+        var av = a._verified ? 1 : 0;
+        var bv = b._verified ? 1 : 0;
+        if (av !== bv) return bv - av;
+        var al = a._latency == null ? 99999 : a._latency;
+        var bl = b._latency == null ? 99999 : b._latency;
+        if (al !== bl) return al - bl;
         return qualityRank(b.quality) - qualityRank(a.quality);
       });
+      for (var ci = 0; ci < out.length; ci++) {
+        delete out[ci]._verified;
+        delete out[ci]._latency;
+      }
       return out;
     });
   });
@@ -466,6 +481,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
 getStreams.loose = false;
 getStreams.maxHeight = 1080;
+getStreams.maxBitrate = 12000000;
 getStreams.filterBase = FILTER_BASE;
 
 if (typeof globalThis !== "undefined") {

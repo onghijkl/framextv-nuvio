@@ -285,8 +285,12 @@ function needsFilter(text) {
     var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
     var h = res ? parseInt(res[2], 10) : 0;
     var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
     if (/hvc1|hev1/i.test(cod)) return true;
     if (h && h > cap) return true;
+    // A very high bitrate buffers hard even below the height cap, so send it
+    // through the cached filter and let it be trimmed there.
+    if (bw && bw > (getStreams.maxBitrate || 12000000)) return true;
   }
   return false;
 }
@@ -604,6 +608,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
 getStreams.direct = true;
 getStreams.maxHeight = 1080;
+getStreams.maxBitrate = 12000000;
 getStreams.filterBase = FILTER_BASE;
 
 if (typeof globalThis !== "undefined") {

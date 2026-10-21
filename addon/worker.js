@@ -253,7 +253,7 @@ async function metasFor(items, type) {
  * Only the small playlist passes through here; segments are fetched by the
  * player straight from the origin.
  */
-async function filterPlaylist(target, cap) {
+async function filterPlaylist(target, cap, maxBw) {
   const res = await fetch(target, {
     headers: { "User-Agent": UA },
     cf: { cacheTtl: 300, cacheEverything: true }
@@ -308,8 +308,12 @@ async function filterPlaylist(target, cap) {
     const codecs = (line.match(/CODECS="([^"]+)"/) || [])[1] || "";
     const hevc = /hvc1|hev1/i.test(codecs);
     const tooTall = height && height > cap;
+    // A bitrate ceiling as well: some ladders advertise a wide but short
+    // variant that slips under the height cap and then buffers hard.
+    const bandwidth = parseInt((line.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+    const tooFat = bandwidth && bandwidth > maxBw;
 
-    if (hevc || tooTall) {
+    if (hevc || tooTall || tooFat) {
       dropped.push({ index: i });
       i++; // also skip the URI line
       continue;
@@ -816,9 +820,10 @@ export default {
       if (path === "/hls") {
         const target = url.searchParams.get("u");
         const cap = parseInt(url.searchParams.get("cap") || "1080", 10) || 1080;
+        const maxBw = parseInt(url.searchParams.get("maxbw") || "12000000", 10) || 12000000;
         if (!target) return cors(JSON.stringify({ error: "missing u" }), 400);
 
-        const filtered = await filterPlaylist(target, cap);
+        const filtered = await filterPlaylist(target, cap, maxBw);
         if (filtered === null) {
           return new Response("upstream playlist unavailable", { status: 502 });
         }
