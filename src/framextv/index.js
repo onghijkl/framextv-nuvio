@@ -420,11 +420,25 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
           }
         }
 
-        // Audio languages, the way 4KHDHub and friends surface them:
-        // the HLS master carries one rendition per language, so naming them
-        // lets the user pick before starting playback.
+        // The quality string carries the audio language, e.g. "720p | Hindi".
+        // Split it out so the title reads resolution, then language - the
+        // alternate-language sources are how the audio choice is offered.
         var audioLabel = "";
-        if (s.audioTracks && s.audioTracks.length) {
+        var resLabel = s.quality || "Auto";
+        if (typeof resLabel === "string" && resLabel.indexOf("|") !== -1) {
+          var parts = resLabel.split("|");
+          resLabel = parts[0].trim();
+          var langs = [];
+          for (var pi = 1; pi < parts.length; pi++) {
+            var pl = parts[pi].trim();
+            if (pl && langs.indexOf(pl) === -1) langs.push(pl);
+          }
+          if (langs.length) audioLabel = " \u2022 " + langs.join(", ");
+        }
+
+        // Fall back to the master's own audio renditions when the label says
+        // nothing about the language.
+        if (!audioLabel && s.audioTracks && s.audioTracks.length) {
           var labels = [];
           for (var at = 0; at < s.audioTracks.length; at++) {
             var a = s.audioTracks[at];
@@ -436,7 +450,7 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
 
         candidates.push({
           name: "ongserv1",
-          title: "ongserv1 \u2022 " + (s.quality || "Auto") + audioLabel +
+          title: "ongserv1 \u2022 " + resLabel + audioLabel +
             (s.server ? " \u2022 " + s.server : ""),
           url: s.url,
           quality: s.quality || "Auto",
@@ -466,7 +480,7 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
       // Subtitles are fetched alongside the streams, so they cost no extra latency.
       var subsPromise = fetchSubtitles(tmdbId, mediaType, season, episode);
 
-      return Promise.all([settleFast(checks, 1, 700), subsPromise]).then(function (both) {
+      return Promise.all([settleFast(checks, 1, 2500), subsPromise]).then(function (both) {
         var prepared = both[0];
         var subs = both[1] || [];
         var out = [];
