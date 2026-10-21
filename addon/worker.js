@@ -161,6 +161,11 @@ function extractArray(text, key) {
 }
 
 /** A TMDB object is a series when it has a name (not title). */
+/** Series is called "series" by Stremio and "tv" by others. */
+function isSeriesType(type) {
+  return type === "series" || type === "tv";
+}
+
 function isSeries(o) {
   if (o.media_type === "tv") return true;
   if (o.media_type === "movie") return false;
@@ -232,7 +237,7 @@ async function metasFor(items, type) {
     items.map(async function (o) {
       if (!o || !o.id) return;
       const series = isSeries(o);
-      if (type === "series" && !series) return;
+      if (isSeriesType(type) && !series) return;
       if (type === "movie" && series) return;
       const meta = toMeta(o);
       const imdb = await imdbIdFor(o.id, series ? "tv" : "movie");
@@ -425,7 +430,7 @@ async function meta(type, rawId) {
 
   if (!/^\d+$/.test(id)) return { meta: null };
 
-  const kind = type === "series" ? "tv" : "movie";
+  const kind = isSeriesType(type) ? "tv" : "movie";
   const base = "https://api.themoviedb.org/3/" + kind + "/" + id;
   // content_ratings gives the certification (TV-MA, 16+ ...), credits the
   // cast and crew, external_ids the IMDb id.
@@ -439,6 +444,19 @@ async function meta(type, rawId) {
   });
   if (!r.ok) return { meta: null };
   const d = await r.json();
+
+  // Trailers and streaming platforms live on their own endpoints. They are
+  // fetched in parallel with the title rather than after it.
+  const [trailersRes, providersRes] = await Promise.all([
+    fetch(base + "/videos" + key, {
+      headers: { Accept: "application/json" },
+      cf: { cacheTtl: 3600, cacheEverything: true }
+    }).catch(function () { return null; }),
+    fetch(base + "/watch/providers" + key, {
+      headers: { Accept: "application/json" },
+      cf: { cacheTtl: 3600, cacheEverything: true }
+    }).catch(function () { return null; })
+  ]);
 
   // Use the id the caller asked with, so the meta id and the video ids line up
   // with what the client is holding.
@@ -460,14 +478,18 @@ async function meta(type, rawId) {
         category: "director",
         name: c.name,
         type: "tmdb-person",
-        tmdbId: String(c.id)
+        tmdbId: String(c.id),
+        // Nuvio's parser skips any link without a url, so cast and crew were
+        // being dropped silently.
+        url: "https://www.themoviedb.org/person/" + c.id
       });
     } else if (c.job === "Writer" && c.name && links.length < 12) {
       links.push({
         category: "writer",
         name: c.name,
         type: "tmdb-person",
-        tmdbId: String(c.id)
+        tmdbId: String(c.id),
+        url: "https://www.themoviedb.org/person/" + c.id
       });
     }
   }
@@ -478,13 +500,14 @@ async function meta(type, rawId) {
       name: c.name,
       character: c.character || undefined,
       type: "tmdb-person",
-      tmdbId: String(c.id)
+      tmdbId: String(c.id),
+      url: "https://www.themoviedb.org/person/" + c.id
     });
   }
 
   const meta = {
     id: baseId,
-    type: type === "series" ? "series" : "movie",
+    type: isSeriesType(type) ? "series" : "movie",
     name: (kind === "tv" ? d.name : d.title) || "",
     description: d.overview || "",
     tagline: d.tagline || undefined,
@@ -517,6 +540,16 @@ async function meta(type, rawId) {
       return g.name;
     }),
     links: links.length ? links : undefined,
+    // Nuvio reads these directly, as well as off the links.
+    cast: (d.credits && d.credits.cast)
+      ? d.credits.cast.map(function (c) { return c.name; }).filter(Boolean)
+      : undefined,
+    director: crew
+      .filter(function (c) { return c.job === "Director"; })
+      .map(function (c) { return c.name; }),
+    writer: crew
+      .filter(function (c) { return c.job === "Writer" || c.job === "Screenplay"; })
+      .map(function (c) { return c.name; }),
   };
 
   if (kind !== "tv") return { meta: meta };
@@ -561,6 +594,52 @@ async function meta(type, rawId) {
         rating: ep.vote_average ? String(Math.round(ep.vote_average * 10) / 10) : undefined
       });
     }
+  }
+
+  // Trailers, in the shape a Stremio client reads.
+  const trailers = [];
+  if (trailersRes && trailersRes.ok) {
+    const tv = await trailersRes.json();
+    for (const v of (tv.results || [])) {
+      if (v.site !== "YouTube" || !v.key) continue;
+      if (v.type && v.type !== "Trailer" && v.type !== "Teaser") continue;
+      trailers.push({ key: v.key, source: v.key, type: "Trailer" });
+      if (trailers.length >= 3) break;
+    }
+  }
+  if (trailers.length) meta.trailers = trailers;
+
+  // Where it is streaming, with the provider's logo.
+  const platforms = [];
+  if (providersRes && providersRes.ok) {
+    const pw = await providersRes.json();
+    const byCountry = (pw.results && pw.results.US) || (pw.results && pw.results.GB) || {};
+    for (const bucket of ["flatrate", "ads", "buy", "rent"]) {
+      for (const pr of byCountry[bucket] || []) {
+        if (!pr.provider_name) continue;
+        if (platforms.some(function (x) { return x.name === pr.provider_name; })) continue;
+        platforms.push({
+          name: pr.provider_name,
+          id: String(pr.provider_id),
+          logo: pr.logo_path ? "https://image.tmdb.org/t/p/w92" + pr.logo_path : undefined,
+          url: "https://www.themoviedb.org/movie/" + id + "/watch?locale=US"
+        });
+      }
+    }
+  }
+  if (platforms.length) {
+    for (const pl of platforms) {
+      links.push({
+        category: "streaming",
+        name: pl.name,
+        type: "tmdb-provider",
+        tmdbId: pl.id,
+        url: pl.url
+      });
+    }
+    meta.app_extras = Object.assign({}, meta.app_extras, {
+      streaming: platforms
+    });
   }
 
   if (videos.length) {
@@ -615,7 +694,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.4.0",
+    version: "1.5.0",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -705,8 +784,8 @@ async function searchPvrPlay(query, type) {
   for (const o of items) {
     if (!o || !o.id) continue;
     const series = isSeries(o);
-    if (type === "series" && !series) continue;
-    if (type === "movie" && series) continue;
+    if (isSeriesType(type) && !series) continue;
+    if (!isSeriesType(type) && series) continue;
   }
   return { metas: await metasFor(items, type) };
 }
