@@ -410,7 +410,11 @@ async function meta(type, rawId) {
 
   const kind = type === "series" ? "tv" : "movie";
   const base = "https://api.themoviedb.org/3/" + kind + "/" + id;
-  const key = "?api_key=" + TMDB_API_KEY;
+  // content_ratings gives the certification (TV-MA, 16+ ...), credits the
+  // cast and crew, external_ids the IMDb id.
+  const key =
+    "?api_key=" + TMDB_API_KEY +
+    "&append_to_response=content_ratings,credits,external_ids";
 
   const r = await fetch(base + key, {
     headers: { Accept: "application/json" },
@@ -423,19 +427,77 @@ async function meta(type, rawId) {
   // with what the client is holding.
   const baseId = /^(tt\d+)$/i.test(requestedId) ? requestedId : "tmdb:" + id;
 
+  // Certification, preferring the viewer's own country where TMDB has one.
+  const ratings = (d.content_ratings && d.content_ratings.results) || [];
+  const byIso = {};
+  for (const r of ratings) byIso[r.iso_3166_1] = r.rating;
+  const cert =
+    byIso.US || byIso.GB || byIso["GB"] || (ratings[0] && ratings[0].rating) || undefined;
+
+  // Cast and crew in the shape a Stremio client expects.
+  const links = [];
+  const crew = (d.credits && d.credits.crew) || [];
+  for (const c of crew) {
+    if (c.job === "Director" && c.name) {
+      links.push({
+        category: "director",
+        name: c.name,
+        type: "tmdb-person",
+        tmdbId: String(c.id)
+      });
+    } else if (c.job === "Writer" && c.name && links.length < 12) {
+      links.push({
+        category: "writer",
+        name: c.name,
+        type: "tmdb-person",
+        tmdbId: String(c.id)
+      });
+    }
+  }
+  for (const c of ((d.credits && d.credits.cast) || []).slice(0, 12)) {
+    if (!c.name) continue;
+    links.push({
+      category: "actor",
+      name: c.name,
+      character: c.character || undefined,
+      type: "tmdb-person",
+      tmdbId: String(c.id)
+    });
+  }
+
   const meta = {
     id: baseId,
     type: type === "series" ? "series" : "movie",
     name: (kind === "tv" ? d.name : d.title) || "",
     description: d.overview || "",
+    tagline: d.tagline || undefined,
     poster: d.poster_path ? IMG + d.poster_path : undefined,
     background: d.backdrop_path ? "https://image.tmdb.org/t/p/w1280" + d.backdrop_path : undefined,
+    logo: d.images && d.images.logos && d.images.logos[0]
+      ? "https://image.tmdb.org/t/p/w500" + d.images.logos[0].file_path
+      : undefined,
     releaseInfo: String((kind === "tv" ? d.first_air_date : d.release_date) || "").slice(0, 4),
+    lastAirDate: kind === "tv" ? d.last_air_date || undefined : undefined,
     imdbRating: d.vote_average ? String(Math.round(d.vote_average * 10) / 10) : undefined,
+    status: d.status || undefined,
+    ageRating: cert,
+    runtime:
+      kind === "movie"
+        ? d.runtime
+          ? d.runtime + "m"
+          : undefined
+        : d.episode_run_time && d.episode_run_time.length
+          ? d.episode_run_time[0] + "m"
+          : undefined,
+    country: (d.origin_country || []).join(", ") || undefined,
+    language: d.original_language || undefined,
+    website: d.homepage || undefined,
+    awards: d.awards || undefined,
+    network: (d.networks || []).map(function (n) { return n.name; }).join(", ") || undefined,
     genres: (d.genres || []).map(function (g) {
       return g.name;
     }),
-    runtime: d.episode_run_time && d.episode_run_time.length ? d.episode_run_time[0] + "min" : undefined
+    links: links.length ? links : undefined,
   };
 
   if (kind !== "tv") return { meta: meta };
@@ -482,7 +544,25 @@ async function meta(type, rawId) {
     }
   }
 
-  if (videos.length) meta.videos = videos;
+  if (videos.length) {
+    meta.videos = videos;
+    // TMDB often leaves episode_run_time empty for a series; the per-episode
+    // runtime is right there in the season data, so use it.
+    if (!meta.runtime) {
+      for (const v of videos) {
+        if (v.runtime) {
+          meta.runtime = v.runtime;
+          break;
+        }
+      }
+    }
+  }
+
+  // Series detail pages show the season and episode totals.
+  if (kind === "tv") {
+    if (d.number_of_seasons) meta.numberOfSeasons = d.number_of_seasons;
+    if (d.number_of_episodes) meta.numberOfEpisodes = d.number_of_episodes;
+  }
   return { meta: meta };
 }
 
