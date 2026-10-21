@@ -262,7 +262,12 @@ async function filterPlaylist(target, cap, maxBw) {
 
   const text = await res.text();
   if (text.indexOf("#EXTM3U") === -1) return null;
-  // A media playlist needs no filtering — hand it straight back.
+
+  // A media playlist needs no filtering and must be handed back untouched.
+  // Some of these run to half a megabyte of segment URLs, and rewriting every
+  // one of them blew the Worker's memory limit ("Memory limit would be exceeded
+  // before EOF"). Relative segment URLs resolve against the CDN's own origin
+  // anyway, so there is nothing to fix up.
   if (text.indexOf("#EXT-X-STREAM-INF") === -1) return text;
 
   const lines = text.split("\n");
@@ -511,7 +516,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.3.0",
+    version: "1.4.0",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
