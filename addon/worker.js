@@ -31,6 +31,20 @@ import "../providers/vidlink.js";
 const PVR_BASE =
   "https://dbhnmkjasgbvsdkjbskkvnskjbfckldsnckjbckjnxkjcsknxjvkjxnvcxknvku.pvrplay.fun";
 
+/**
+ * Poster service, keyed on the IMDb id.
+ *
+ * The catalogue is emitted with IMDb ids, so posters are fetched by that
+ * rather than by TMDB path. Unknown ids redirect to a default, so a title
+ * without a poster still shows something rather than nothing.
+ */
+const POSTER =
+  "https://btttr.cc/poster-qa/imdb/poster-default/";
+
+function posterUrl(imdbId) {
+  return imdbId ? POSTER + imdbId + ".jpg?rs=IM" : undefined;
+}
+
 const IMG = "https://image.tmdb.org/t/p/w500";
 
 const UA =
@@ -222,7 +236,10 @@ async function metasFor(items, type) {
       if (type === "movie" && series) return;
       const meta = toMeta(o);
       const imdb = await imdbIdFor(o.id, series ? "tv" : "movie");
-      if (imdb) meta.id = imdb;
+      if (imdb) {
+        meta.id = imdb;
+        meta.poster = posterUrl(imdb) || meta.poster;
+      }
       // "Minions & Monsters (2026) [Tam + Eng]" -> drop the redundant year, the
       // row already shows it, but keep the language tag as it is useful.
       meta.name = String(meta.name)
@@ -471,7 +488,9 @@ async function meta(type, rawId) {
     name: (kind === "tv" ? d.name : d.title) || "",
     description: d.overview || "",
     tagline: d.tagline || undefined,
-    poster: d.poster_path ? IMG + d.poster_path : undefined,
+    poster:
+      posterUrl(d.external_ids && d.external_ids.imdb_id) ||
+      (d.poster_path ? IMG + d.poster_path : undefined),
     background: d.backdrop_path ? "https://image.tmdb.org/t/p/w1280" + d.backdrop_path : undefined,
     logo: d.images && d.images.logos && d.images.logos[0]
       ? "https://image.tmdb.org/t/p/w500" + d.images.logos[0].file_path
