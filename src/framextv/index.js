@@ -31,7 +31,7 @@
  */
 
 var SITE = "https://framextv.xyz";
-var API_BASE = "https://api.framextv.tech";
+var API_BASE = "https://api.framextv.cc";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 6500;
 // Playlist filter (the Cloudflare Worker in addon/) — caps resolution and
@@ -224,6 +224,38 @@ function absUrl(base, rel) {
   return base.substring(0, base.lastIndexOf("/") + 1) + rel;
 }
 
+
+/**
+ * Fetch the subtitle renditions frameXTV offers for a title.
+ *
+ * The site exposes /api/subtitles, returning one entry per language -
+ * typically 40-50 of them. We were discarding all of it, which is why our
+ * sources showed no language options while the site itself does.
+ */
+function fetchSubtitles(tmdbId, mediaType, season, episode) {
+  var url = API_BASE + "/api/subtitles?" + qs({ id: tmdbId, type: mediaType });
+  if (mediaType === "tv") {
+    url += "&season=" + (season || 1) + "&episode=" + (episode || 1);
+  }
+  return timedFetch(url)
+    .then(function (r) {
+      if (!r || !r.ok) return [];
+      return r.json();
+    })
+    .then(function (j) {
+      var arr = Array.isArray(j) ? j : (j && (j.subtitles || j.data)) || [];
+      var out = [];
+      for (var i = 0; i < arr.length; i++) {
+        var t = arr[i];
+        if (!t || !t.url) continue;
+        out.push({ url: t.url, lang: t.lang || t.language || t.label || "Unknown" });
+      }
+      return out;
+    })
+    .catch(function () {
+      return [];
+    });
+}
 
 /**
  * Validate one source and reduce it to something playable.
@@ -431,7 +463,12 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
         })(ci);
       }
 
-      return settleFast(checks, 1, 700).then(function (prepared) {
+      // Subtitles are fetched alongside the streams, so they cost no extra latency.
+      var subsPromise = fetchSubtitles(tmdbId, mediaType, season, episode);
+
+      return Promise.all([settleFast(checks, 1, 700), subsPromise]).then(function (both) {
+        var prepared = both[0];
+        var subs = both[1] || [];
         var out = [];
         var seen = {};
 
@@ -448,6 +485,9 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
         out.sort(function (a, b) {
           return qualityRank(b.quality) - qualityRank(a.quality);
         });
+        for (var si = 0; si < out.length; si++) {
+          if (subs.length) out[si].subtitles = subs;
+        }
         return out;
       });
     })
