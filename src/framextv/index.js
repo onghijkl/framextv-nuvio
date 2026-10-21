@@ -30,7 +30,7 @@
  * index (which covers all of TMDB and therefore proves nothing).
  */
 
-var SITE = "https://framextv.xyz";
+var SITE = "https://framextv.cc";
 var API_BASE = "https://api.framextv.cc";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 6500;
