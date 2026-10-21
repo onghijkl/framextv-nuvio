@@ -287,6 +287,17 @@ async function filterPlaylist(target, cap) {
 async function meta(type, rawId) {
   let id = String(rawId).trim();
 
+  // Stremio asks for series meta as <id>:<season>:<episode>. That suffix has
+  // to come off before the id is resolved, or a tt... id never matches the
+  // numeric-only branch and the lookup 404s - which is why series resolved
+  // nowhere and no streams were ever requested.
+  const suffix = id.match(/^(.*):(\d+):(\d+)$/);
+  if (suffix) id = suffix[1];
+
+  // Remember the id as the caller wrote it, so the meta and its videos come
+  // back with matching ids.
+  const requestedId = id;
+
   // Nuvio converts a tmdb: id to an IMDb id before looking meta up
   // (resolveMetaLookupId -> TmdbService.tmdbToImdb), so this handler is reached
   // with either form. Accept both.
@@ -319,8 +330,12 @@ async function meta(type, rawId) {
   if (!r.ok) return { meta: null };
   const d = await r.json();
 
+  // Use the id the caller asked with, so the meta id and the video ids line up
+  // with what the client is holding.
+  const baseId = /^(tt\d+)$/i.test(requestedId) ? requestedId : "tmdb:" + id;
+
   const meta = {
-    id: "tmdb:" + id,
+    id: baseId,
     type: type === "series" ? "series" : "movie",
     name: (kind === "tv" ? d.name : d.title) || "",
     description: d.overview || "",
@@ -364,7 +379,7 @@ async function meta(type, rawId) {
     for (const ep of season.episodes) {
       if (!ep || ep.episode_number == null) continue;
       videos.push({
-        id: "tmdb:" + id + ":" + season.season_number + ":" + ep.episode_number,
+        id: baseId + ":" + season.season_number + ":" + ep.episode_number,
         name: ep.name || "Episode " + ep.episode_number,
         season: season.season_number,
         episode: ep.episode_number,
