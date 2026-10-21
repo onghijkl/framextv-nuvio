@@ -143,7 +143,9 @@ function toMeta(o) {
   const series = isSeries(o);
   const date = series ? o.first_air_date : o.release_date;
   const meta = {
-    id: "tmdb:" + o.id,
+    // Prefer the IMDb id: it is what every Stremio client understands
+    // natively, and the standard metadata addon only handles "tt" prefixes.
+    id: o.imdb_id || "tmdb:" + o.id,
     type: series ? "series" : "movie",
     name: o.title || o.name || "Unknown"
   };
@@ -153,6 +155,69 @@ function toMeta(o) {
   if (o.vote_average) meta.imdbRating = String(Math.round(o.vote_average * 10) / 10);
   if (o.overview) meta.description = o.overview;
   return meta;
+}
+
+
+/**
+ * Resolve a TMDB id to its IMDb id.
+ *
+ * Why: every Stremio client understands IMDb ids natively, and the standard
+ * metadata addon (Cinemeta) only handles "tt" prefixes. A catalog item with a
+ * "tmdb:" id therefore has no metadata to resolve, so a series has no episode
+ * list and the client never asks for streams. Nuvio's own catalog uses IMDb
+ * ids for exactly this reason.
+ *
+ * The mapping never changes, so it is cached at the edge for 30 days and
+ * in memory for the isolate's lifetime.
+ */
+const imdbCache = new Map();
+
+async function imdbIdFor(tmdbId, kind) {
+  const key = kind + ":" + tmdbId;
+  if (imdbCache.has(key)) return imdbCache.get(key);
+  let imdb = null;
+  try {
+    const r = await fetch(
+      "https://api.themoviedb.org/3/" + kind + "/" + tmdbId +
+        "/external_ids?api_key=" + TMDB_API_KEY,
+      { headers: { Accept: "application/json" }, cf: { cacheTtl: 2592000, cacheEverything: true } }
+    );
+    if (r.ok) {
+      const j = await r.json();
+      imdb = j.imdb_id || null;
+    }
+  } catch (e) {
+    imdb = null;
+  }
+  imdbCache.set(key, imdb);
+  return imdb;
+}
+
+/**
+ * Build catalog metas, preferring the IMDb id as the item id.
+ * Falls back to "tmdb:<id>" when a title has no IMDb entry.
+ */
+async function metasFor(items, type) {
+  const out = [];
+  await Promise.all(
+    items.map(async function (o) {
+      if (!o || !o.id) return;
+      const series = isSeries(o);
+      if (type === "series" && !series) return;
+      if (type === "movie" && series) return;
+      const meta = toMeta(o);
+      const imdb = await imdbIdFor(o.id, series ? "tv" : "movie");
+      if (imdb) meta.id = imdb;
+      // "Minions & Monsters (2026) [Tam + Eng]" -> drop the redundant year, the
+      // row already shows it, but keep the language tag as it is useful.
+      meta.name = String(meta.name)
+        .replace(/\s*\((19|20)\d{2}\)\s*/g, " ")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      out.push(meta);
+    })
+  );
+  return out;
 }
 
 /* -------------------------------------------------------- playlist filter */
@@ -436,7 +501,7 @@ function manifest() {
       // No idPrefixes here on purpose. Nuvio rewrites a tmdb: id to an IMDb
       // id before resolving meta, then filters addons by idPrefixes — so
       // declaring "tmdb:" means this resource is never consulted.
-      { name: "meta", types: ["movie", "series"] }
+      { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:"] }
     ],
     types: ["movie", "series"],
     idPrefixes: ["tmdb:"],
@@ -517,9 +582,8 @@ async function searchPvrPlay(query, type) {
     const series = isSeries(o);
     if (type === "series" && !series) continue;
     if (type === "movie" && series) continue;
-    metas.push(toMeta(o));
   }
-  return { metas: metas };
+  return { metas: await metasFor(items, type) };
 }
 
 async function catalog(type, id, extra) {
@@ -552,16 +616,15 @@ async function catalog(type, id, extra) {
       const series = isSeries(o);
       if (type === "series" && !series) continue;
       if (type === "movie" && series) continue;
-      metas.push(toMeta(o));
     }
-    return { metas: metas };
+    return { metas: await metasFor(row.items, type) };
   }
 
   // TMDB-backed rows (the Hindi ones).
   if (def.src === "tmdb") {
     const kind = type === "series" ? "tv" : "movie";
     const params = new URLSearchParams(
-      Object.assign({}, def.query, { api_key: TMDB_API_KEY, page: "1" })
+      Object.assign({}, def.query, { api_key: TMDB_API_KEY, page: "1", with_external_ids: "imdb_id" })
     );
     const r = await fetch("https://api.themoviedb.org/3/discover/" + kind + "?" + params, {
       headers: { Accept: "application/json" },
@@ -569,12 +632,12 @@ async function catalog(type, id, extra) {
     });
     if (!r.ok) return { metas: [] };
     const data = await r.json();
-    const metas = [];
-    for (const o of data.results || []) {
-      if (!o || !o.id) continue;
-      metas.push(toMeta(Object.assign({}, o, { media_type: kind === "tv" ? "tv" : "movie" })));
-    }
-    return { metas: metas };
+    // discover has no with_external_ids, so the IMDb ids come from the same
+    // per-title lookup the other rows use.
+    const items = (data.results || []).map(function (o) {
+      return Object.assign({}, o, { media_type: kind === "tv" ? "tv" : "movie" });
+    });
+    return { metas: await metasFor(items, type) };
   }
 
   const res = await fetch(PVR_BASE + def.path, {
@@ -587,7 +650,7 @@ async function catalog(type, id, extra) {
   const items = extractArray(rscPayload(html), def.key);
   if (!items) return { metas: [] };
 
-  const metas = [];
+  const normalised = [];
   for (const raw of items) {
     if (!raw) continue;
     // Some PvrPlay pages (e.g. /tamil-blasters) key the item as tmdb_id rather
@@ -596,21 +659,9 @@ async function catalog(type, id, extra) {
     const o = Object.assign({}, raw);
     if (!o.id && o.tmdb_id) o.id = o.tmdb_id;
     if (!o.id) continue;
-
-    const series = isSeries(o);
-    // Only surface rows matching the type the client asked for.
-    if (type === "series" && !series) continue;
-    if (type === "movie" && series) continue;
-
-    const meta = toMeta(o);
-    // "Minions & Monsters (2026) [Tam + Eng]" -> drop the redundant year, the
-    // row already shows it, but keep the language tag as it is useful.
-    meta.name = String(meta.name)
-      .replace(/\s*\((19|20)\d{2}\)\s*/g, " ")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    metas.push(meta);
+    normalised.push(o);
   }
+  return { metas: await metasFor(normalised, type) };
   return { metas: metas };
 }
 
