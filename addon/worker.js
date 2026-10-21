@@ -697,6 +697,15 @@ export default {
       const mm = path.match(/^\/meta\/([^/]+)\/(.+?)\.json$/);
       if (mm) {
         const data = await meta(decodeURIComponent(mm[1]), decodeURIComponent(mm[2]));
+        // 404 rather than {"meta":null}: Nuvio stops at the first addon that
+        // returns a parseable meta, and an empty one would suppress the
+        // episode list that the metadata addons provide.
+        if (!data || !data.meta) {
+          return new Response("not found", {
+            status: 404,
+            headers: { "Access-Control-Allow-Origin": "*" }
+          });
+        }
         return cors(JSON.stringify(data));
       }
 
