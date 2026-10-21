@@ -705,7 +705,11 @@ async function resolveStreams(type, rawId) {
       // response past what a Stremio client will wait for.
       let timer = null;
       try {
-        const work = mod.getStreams(id, type, season, episode).then(function (v) {
+        // Stremio calls a series "series"; the providers expect Nuvio's "tv".
+        // Without the translation the provider treated every series as a movie
+        // and looked up the wrong TMDB result set, so no series ever resolved.
+        const providerType = type === "series" ? "tv" : type;
+        const work = mod.getStreams(id, providerType, season, episode).then(function (v) {
           return v || [];
         });
         const capped = new Promise(function (resolve) {
