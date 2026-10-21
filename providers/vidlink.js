@@ -306,6 +306,9 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 getStreams.maxHeight = 1080;
 getStreams.filterBase = FILTER_BASE;
 
+if (typeof globalThis !== "undefined") {
+  globalThis.__ONGserv3 = { getStreams: getStreams };
+}
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
 } else {

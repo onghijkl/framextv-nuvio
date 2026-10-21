@@ -1,3 +1,9 @@
+// The providers are plain scripts whose footers expose a namespaced global,
+// so they can be imported here and used as Stremio stream resolvers.
+import "../providers/framextv.js";
+import "../providers/pvrplay.js";
+import "../providers/vidlink.js";
+
 /**
  * PvrPlay Catalogs — a Stremio-protocol addon for Nuvio
  *
@@ -411,6 +417,7 @@ function manifest() {
       "Home-screen rows from PvrPlay, mirroring the site. Every title listed is one PvrPlay carries.",
     resources: [
       { name: "catalog", types: ["movie", "series"] },
+      { name: "stream", types: ["movie", "series"] },
       // No idPrefixes here on purpose. Nuvio rewrites a tmdb: id to an IMDb
       // id before resolving meta, then filters addons by idPrefixes — so
       // declaring "tmdb:" means this resource is never consulted.
@@ -592,6 +599,78 @@ async function catalog(type, id, extra) {
   return { metas: metas };
 }
 
+/**
+ * Resolve streams from every provider.
+ *
+ * Stremio series ids arrive as <id>:<season>:<episode>, so the tail is split
+ * off before calling a provider, which takes them separately.
+ */
+// Per-provider cap. Stremio clients give up around 8s, so the slowest
+// provider must not drag the whole response past that.
+const PROVIDER_TIMEOUT_MS = 6000;
+
+async function resolveStreams(type, rawId) {
+  let id = rawId;
+  let season = null;
+  let episode = null;
+
+  if (type === "series") {
+    const m = id.match(/^(.*):(\d+):(\d+)$/);
+    if (m) {
+      id = m[1];
+      season = parseInt(m[2], 10);
+      episode = parseInt(m[3], 10);
+    }
+  }
+
+  const providers = [
+    { global: "__ONGserv1", name: "ongserv1" },
+    { global: "__ONGserv2", name: "ongserv2" },
+    { global: "__ONGserv3", name: "vidlink" }
+  ];
+
+  // Run the providers in parallel: each does its own upstream scraping, and
+  // doing them in sequence meant the slowest one set the response time.
+  const results = await Promise.all(
+    providers.map(async function (p) {
+      const mod = globalThis[p.global];
+      if (!mod || typeof mod.getStreams !== "function") return { p: p, streams: [] };
+      // Cap each provider: one slow upstream should not hold the whole
+      // response past what a Stremio client will wait for.
+      let timer = null;
+      try {
+        const work = mod.getStreams(id, type, season, episode).then(function (v) {
+          return v || [];
+        });
+        const capped = new Promise(function (resolve) {
+          timer = setTimeout(function () { resolve([]); }, PROVIDER_TIMEOUT_MS);
+        });
+        return { p: p, streams: (await Promise.race([work, capped])) || [] };
+      } catch (e) {
+        return { p: p, streams: [] };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    })
+  );
+
+  const out = [];
+  for (const r of results) {
+    for (const st of r.streams) {
+      if (!st || !st.url) continue;
+      out.push({
+        name: r.p.name,
+        title: st.title || r.p.name,
+        url: st.url,
+        quality: st.quality || "Auto",
+        size: st.size && st.size !== "Unknown" ? st.size : undefined,
+        behaviorHints: { notWebReady: false, bingeGroup: r.p.name }
+      });
+    }
+  }
+  return out;
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -606,6 +685,14 @@ export default {
         return cors(JSON.stringify(manifest()));
       }
 
+      // Stremio stream endpoint. The id may be tt123, tmdb:123 or a bare
+      // number; for series Stremio appends :season:episode.
+      const str = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
+      if (str) {
+        return cors(
+          JSON.stringify({ streams: await resolveStreams(str[1], decodeURIComponent(str[2])) })
+        );
+      }
       // /meta/<type>/<id>.json
       const mm = path.match(/^\/meta\/([^/]+)\/(.+?)\.json$/);
       if (mm) {
