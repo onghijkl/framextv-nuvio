@@ -392,9 +392,11 @@ function extract(tmdbId, mediaType, season, episode, meta) {
         }
         out.push({
           name: "ongserv2",
+          // label carries the audio variant ("Alpha - English") - the
+          // 4KHDHub-style detail worth showing.
           title: "ongserv2 \u2022 " + (s.quality || "Auto") +
-            (s.scraperName ? " \u2022 " + s.scraperName : "") +
-            (s.label ? " \u2022 " + s.label : ""),
+            (s.label ? " \u2022 " + s.label : "") +
+            (s.scraperName ? " \u2022 " + s.scraperName : ""),
           url: s.url,
           quality: s.quality || "Auto",
           size: "Unknown",

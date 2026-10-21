@@ -63,8 +63,8 @@ const CATALOGS = [
   // --- browse pages ---
   { id: "pvr-movies", path: "/movies", key: "initialMovies", name: "PvrPlay Movies", types: ["movie"], search: true },
   { id: "pvr-tvshows", path: "/tv-shows", key: "initialShows", name: "PvrPlay TV Shows", types: ["series"], search: true },
-  { id: "pvr-tamil", path: "/tamil-blasters", key: "initialMovies", name: "Tamil / Telugu", types: ["movie"] },
-  { id: "pvr-shudder", path: "/platform/99", key: "initialItems", name: "PvrPlay Shudder", types: ["movie"] },
+  { id: "pvr-tamil", path: "/tamil-blasters", key: "initialMovies", name: "Tamil / Telugu", types: ["movie"], search: true },
+  { id: "pvr-shudder", path: "/platform/99", key: "initialItems", name: "PvrPlay Shudder", types: ["movie"], search: true },
 
   // --- Hindi rows. PvrPlay exposes no Hindi listing and its genre pages are
   // client-rendered, so these come from TMDB discover instead. Providers carry
@@ -91,18 +91,33 @@ function rscPayload(html) {
     // performs the unescaping. Do NOT pre-escape quotes here: adding
     // backslashes before already-valid characters produces invalid JSON and
     // silently falls through to the raw (still-escaped) text.
-    try {
-      out += JSON.parse('"' + raw + '"');
-    } catch (e) {
-      out += raw;
+    // Some pages (the search page among them) double-escape the payload, so
+    // a single pass still leaves the keys escaped as \"initialResults\":[.
+    // Keep unwrapping while the result still carries escaped quotes.
+    let chunk = raw;
+    for (let pass = 0; pass < 4; pass++) {
+      let decoded;
+      try {
+        decoded = JSON.parse('"' + chunk + '"');
+      } catch (e) {
+        break;
+      }
+      if (decoded === chunk) break;
+      chunk = decoded;
+      if (chunk.indexOf('\\"') === -1) break;
     }
+    out += chunk;
   }
   return out;
 }
 
 /** Pull one balanced JSON array out of the payload by key name. */
 function extractArray(text, key) {
-  const at = text.indexOf('"' + key + '":[');
+  // Some pages (the search page among them) leave the keys escaped as
+  // backslash-quote key backslash-quote colon bracket, while the values are
+  // already plain. Accept both forms.
+  let at = text.indexOf('"' + key + '":[');
+  if (at < 0) at = text.indexOf('\"' + key + '\":[', 0);
   if (at < 0) return null;
   const start = text.indexOf("[", at);
 
@@ -483,8 +498,10 @@ function manifest() {
     for (const t of c.types) {
       const entry = { type: t, id: c.id, name: c.name };
       // Declaring the search extra is what makes a catalog searchable — without
-      // it the client never offers a search field for the row.
-      if (c.search) entry.extra = [{ name: "search", isRequired: false }];
+      // it the client never offers a search field for the row. PvrPlay's own
+      // search spans the whole catalogue, so every row gets it: a search from
+      // any row returns the same comprehensive result set.
+      entry.extra = [{ name: "search", isRequired: false }];
       catalogs.push(entry);
     }
   }
@@ -586,15 +603,31 @@ async function searchPvrPlay(query, type) {
   return { metas: await metasFor(items, type) };
 }
 
+/**
+ * Apply the skip offset a client sends when scrolling a row.
+ *
+ * Without it, scrolling re-fetches the same first page, so a long row can
+ * never be scrolled past its first items.
+ */
+function applySkip(metas, extra) {
+  if (!extra) return metas;
+  const skip = parseInt(extra.skip, 10);
+  if (!isFinite(skip) || skip <= 0) return metas;
+  return metas.slice(skip);
+}
+
 async function catalog(type, id, extra) {
   const def = CATALOGS.find(function (c) {
     return c.id === id;
   });
   if (!def) return { metas: [] };
 
-  // A search on a searchable catalog goes straight to PvrPlay's own search.
+  // A search goes straight to PvrPlay's own search, whichever row asked.
+  // The site's search covers the whole catalogue, so every row can be
+  // searchable rather than just the two that happen to list films.
   if (extra && extra.search) {
-    return searchPvrPlay(extra.search, type);
+    const found = await searchPvrPlay(extra.search, type);
+    return { metas: applySkip(found.metas, extra) };
   }
 
   // Rows lifted from the PvrPlay home screen.
@@ -617,7 +650,7 @@ async function catalog(type, id, extra) {
       if (type === "series" && !series) continue;
       if (type === "movie" && series) continue;
     }
-    return { metas: await metasFor(row.items, type) };
+    return { metas: applySkip(await metasFor(row.items, type), extra) };
   }
 
   // TMDB-backed rows (the Hindi ones).
@@ -637,7 +670,7 @@ async function catalog(type, id, extra) {
     const items = (data.results || []).map(function (o) {
       return Object.assign({}, o, { media_type: kind === "tv" ? "tv" : "movie" });
     });
-    return { metas: await metasFor(items, type) };
+    return { metas: applySkip(await metasFor(items, type), extra) };
   }
 
   const res = await fetch(PVR_BASE + def.path, {

@@ -388,9 +388,23 @@ function directSources(tmdbId, mediaType, season, episode, meta) {
           }
         }
 
+        // Audio languages, the way 4KHDHub and friends surface them:
+        // the HLS master carries one rendition per language, so naming them
+        // lets the user pick before starting playback.
+        var audioLabel = "";
+        if (s.audioTracks && s.audioTracks.length) {
+          var labels = [];
+          for (var at = 0; at < s.audioTracks.length; at++) {
+            var a = s.audioTracks[at];
+            var lab = a && (a.label || a.language);
+            if (lab && labels.indexOf(lab) === -1) labels.push(lab);
+          }
+          if (labels.length) audioLabel = " \u2022 " + labels.join(", ");
+        }
+
         candidates.push({
           name: "ongserv1",
-          title: "ongserv1 \u2022 " + (s.quality || "Auto") +
+          title: "ongserv1 \u2022 " + (s.quality || "Auto") + audioLabel +
             (s.server ? " \u2022 " + s.server : ""),
           url: s.url,
           quality: s.quality || "Auto",
