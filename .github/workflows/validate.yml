@@ -16,13 +16,13 @@ jobs:
         with:
           node-version: "22"
 
-      # Fails if providers/framextv.js and src/framextv/index.js have drifted,
+      # Fails if any providers/<name>.js has drifted from src/<name>/index.js,
       # and if the built file exports getStreams or contains console calls.
       - name: Build and validate
         run: |
           node tools/build.js
-          if ! git diff --quiet -- providers/framextv.js; then
-            echo "::error::providers/framextv.js is out of date. Run 'node tools/build.js' and commit the result."
+          if ! git diff --quiet -- providers/; then
+            echo "::error::providers/ is out of date. Run 'node tools/build.js' and commit the result."
             exit 1
           fi
 
@@ -50,6 +50,8 @@ jobs:
         run: |
           node tools/test.js 1288069 movie | tee /tmp/pos1.txt
           node tools/test.js 1396 tv 1 1 | tee /tmp/pos2.txt
+          node tools/test.js 550 movie --provider=pvrplay | tee /tmp/pos3.txt
+          ! grep -q "\] 0 stream(s)" /tmp/pos3.txt
           grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos1.txt
           grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos2.txt
 

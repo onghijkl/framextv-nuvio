@@ -232,13 +232,14 @@ async function imdbIdFor(tmdbId, kind) {
  * Falls back to "tmdb:<id>" when a title has no IMDb entry.
  */
 async function metasFor(items, type) {
-  const out = [];
-  await Promise.all(
+  // map + filter, not push-after-await: pushing as lookups finished made the
+  // row order depend on which TMDB call returned first.
+  const out = await Promise.all(
     items.map(async function (o) {
-      if (!o || !o.id) return;
+      if (!o || !o.id) return null;
       const series = isSeries(o);
-      if (isSeriesType(type) && !series) return;
-      if (type === "movie" && series) return;
+      if (isSeriesType(type) && !series) return null;
+      if (type === "movie" && series) return null;
       const meta = toMeta(o);
       const imdb = await imdbIdFor(o.id, series ? "tv" : "movie");
       if (imdb) {
@@ -251,10 +252,16 @@ async function metasFor(items, type) {
         .replace(/\s*\((19|20)\d{2}\)\s*/g, " ")
         .replace(/\s{2,}/g, " ")
         .trim();
-      out.push(meta);
+      return meta;
     })
   );
-  return out;
+  // A title can appear twice in one row (same IMDb id); keep the first.
+  const seen = new Set();
+  return out.filter(function (m) {
+    if (!m || seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
 }
 
 /* -------------------------------------------------------- playlist filter */
@@ -434,9 +441,15 @@ async function meta(type, rawId) {
   const base = "https://api.themoviedb.org/3/" + kind + "/" + id;
   // content_ratings gives the certification (TV-MA, 16+ ...), credits the
   // cast and crew, external_ids the IMDb id.
+  // Movies carry certifications under release_dates; content_ratings is TV-only.
+  // videos and watch/providers ride along via append_to_response, so the whole
+  // title is ONE request instead of three.
+  const plainKey = "?api_key=" + TMDB_API_KEY;
   const key =
-    "?api_key=" + TMDB_API_KEY +
-    "&append_to_response=content_ratings,credits,external_ids";
+    plainKey +
+    "&append_to_response=" +
+    (kind === "tv" ? "content_ratings" : "release_dates") +
+    ",credits,external_ids,videos,watch/providers,images&include_image_language=en,null";
 
   const r = await fetch(base + key, {
     headers: { Accept: "application/json" },
@@ -444,30 +457,27 @@ async function meta(type, rawId) {
   });
   if (!r.ok) return { meta: null };
   const d = await r.json();
-
-  // Trailers and streaming platforms live on their own endpoints. They are
-  // fetched in parallel with the title rather than after it.
-  const [trailersRes, providersRes] = await Promise.all([
-    fetch(base + "/videos" + key, {
-      headers: { Accept: "application/json" },
-      cf: { cacheTtl: 3600, cacheEverything: true }
-    }).catch(function () { return null; }),
-    fetch(base + "/watch/providers" + key, {
-      headers: { Accept: "application/json" },
-      cf: { cacheTtl: 3600, cacheEverything: true }
-    }).catch(function () { return null; })
-  ]);
+  const videosData = d.videos || null;
+  const providersData = d["watch/providers"] || null;
 
   // Use the id the caller asked with, so the meta id and the video ids line up
   // with what the client is holding.
   const baseId = /^(tt\d+)$/i.test(requestedId) ? requestedId : "tmdb:" + id;
 
   // Certification, preferring the viewer's own country where TMDB has one.
-  const ratings = (d.content_ratings && d.content_ratings.results) || [];
   const byIso = {};
-  for (const r of ratings) byIso[r.iso_3166_1] = r.rating;
-  const cert =
-    byIso.US || byIso.GB || byIso["GB"] || (ratings[0] && ratings[0].rating) || undefined;
+  if (kind === "tv") {
+    for (const cr of (d.content_ratings && d.content_ratings.results) || []) {
+      if (cr.rating) byIso[cr.iso_3166_1] = cr.rating;
+    }
+  } else {
+    for (const rd of (d.release_dates && d.release_dates.results) || []) {
+      const c = (rd.release_dates || []).map(function (x) { return x.certification; }).find(Boolean);
+      if (c) byIso[rd.iso_3166_1] = c;
+    }
+  }
+  const firstCert = Object.keys(byIso).map(function (k) { return byIso[k]; })[0];
+  const cert = byIso.US || byIso.GB || byIso.IN || firstCert || undefined;
 
   // Cast and crew in the shape a Stremio client expects.
   const links = [];
@@ -552,6 +562,48 @@ async function meta(type, rawId) {
       .map(function (c) { return c.name; }),
   };
 
+  // Trailers, in the shape a Stremio client reads. Applied to movies too —
+  // they used to be computed after the movie early-return, so films never
+  // got trailers or platforms.
+  const trailers = [];
+  for (const v of (videosData && videosData.results) || []) {
+    if (v.site !== "YouTube" || !v.key) continue;
+    if (v.type && v.type !== "Trailer" && v.type !== "Teaser") continue;
+    trailers.push({ key: v.key, source: v.key, type: "Trailer" });
+    if (trailers.length >= 3) break;
+  }
+  if (trailers.length) meta.trailers = trailers;
+
+  // Where it is streaming, with the provider's logo.
+  const platforms = [];
+  const pres = (providersData && providersData.results) || {};
+  const byCountry = pres.US || pres.GB || pres.IN || {};
+  for (const bucket of ["flatrate", "ads", "buy", "rent"]) {
+    for (const pr of byCountry[bucket] || []) {
+      if (!pr.provider_name) continue;
+      if (platforms.some(function (x) { return x.name === pr.provider_name; })) continue;
+      platforms.push({
+        name: pr.provider_name,
+        id: String(pr.provider_id),
+        logo: pr.logo_path ? "https://image.tmdb.org/t/p/w92" + pr.logo_path : undefined,
+        url: "https://www.themoviedb.org/" + kind + "/" + id + "/watch?locale=US"
+      });
+    }
+  }
+  if (platforms.length) {
+    for (const pl of platforms) {
+      links.push({
+        category: "streaming",
+        name: pl.name,
+        type: "tmdb-provider",
+        tmdbId: pl.id,
+        url: pl.url
+      });
+    }
+    if (!meta.links) meta.links = links;
+    meta.app_extras = Object.assign({}, meta.app_extras, { streaming: platforms });
+  }
+
   if (kind !== "tv") return { meta: meta };
 
   // Episodes. Seasons are fetched in parallel; a show with many seasons costs
@@ -563,7 +615,7 @@ async function meta(type, rawId) {
 
   const results = await Promise.all(
     wanted.map(function (s) {
-      return fetch(base + "/season/" + s.season_number + key, {
+      return fetch(base + "/season/" + s.season_number + plainKey, {
         headers: { Accept: "application/json" },
         cf: { cacheTtl: 3600, cacheEverything: true }
       })
@@ -594,52 +646,6 @@ async function meta(type, rawId) {
         rating: ep.vote_average ? String(Math.round(ep.vote_average * 10) / 10) : undefined
       });
     }
-  }
-
-  // Trailers, in the shape a Stremio client reads.
-  const trailers = [];
-  if (trailersRes && trailersRes.ok) {
-    const tv = await trailersRes.json();
-    for (const v of (tv.results || [])) {
-      if (v.site !== "YouTube" || !v.key) continue;
-      if (v.type && v.type !== "Trailer" && v.type !== "Teaser") continue;
-      trailers.push({ key: v.key, source: v.key, type: "Trailer" });
-      if (trailers.length >= 3) break;
-    }
-  }
-  if (trailers.length) meta.trailers = trailers;
-
-  // Where it is streaming, with the provider's logo.
-  const platforms = [];
-  if (providersRes && providersRes.ok) {
-    const pw = await providersRes.json();
-    const byCountry = (pw.results && pw.results.US) || (pw.results && pw.results.GB) || {};
-    for (const bucket of ["flatrate", "ads", "buy", "rent"]) {
-      for (const pr of byCountry[bucket] || []) {
-        if (!pr.provider_name) continue;
-        if (platforms.some(function (x) { return x.name === pr.provider_name; })) continue;
-        platforms.push({
-          name: pr.provider_name,
-          id: String(pr.provider_id),
-          logo: pr.logo_path ? "https://image.tmdb.org/t/p/w92" + pr.logo_path : undefined,
-          url: "https://www.themoviedb.org/movie/" + id + "/watch?locale=US"
-        });
-      }
-    }
-  }
-  if (platforms.length) {
-    for (const pl of platforms) {
-      links.push({
-        category: "streaming",
-        name: pl.name,
-        type: "tmdb-provider",
-        tmdbId: pl.id,
-        url: pl.url
-      });
-    }
-    meta.app_extras = Object.assign({}, meta.app_extras, {
-      streaming: platforms
-    });
   }
 
   if (videos.length) {
@@ -688,13 +694,14 @@ function manifest() {
       // it the client never offers a search field for the row. PvrPlay's own
       // search spans the whole catalogue, so every row gets it: a search from
       // any row returns the same comprehensive result set.
-      entry.extra = [{ name: "search", isRequired: false }];
+      // skip must be declared too, or clients never ask for the next page.
+      entry.extra = [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }];
       catalogs.push(entry);
     }
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.5.0",
+    version: "1.6.0",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -780,13 +787,6 @@ async function searchPvrPlay(query, type) {
   const items = extractArray(rscPayload(await r.text()), "initialResults");
   if (!items) return { metas: [] };
 
-  const metas = [];
-  for (const o of items) {
-    if (!o || !o.id) continue;
-    const series = isSeries(o);
-    if (isSeriesType(type) && !series) continue;
-    if (!isSeriesType(type) && series) continue;
-  }
   return { metas: await metasFor(items, type) };
 }
 
@@ -830,21 +830,17 @@ async function catalog(type, id, extra) {
     });
     if (!row) return { metas: [] };
 
-    const metas = [];
-    for (const o of row.items) {
-      if (!o || !o.id) continue;
-      const series = isSeries(o);
-      if (type === "series" && !series) continue;
-      if (type === "movie" && series) continue;
-    }
     return { metas: applySkip(await metasFor(row.items, type), extra) };
   }
 
   // TMDB-backed rows (the Hindi ones).
   if (def.src === "tmdb") {
     const kind = type === "series" ? "tv" : "movie";
+    // Map the client's skip offset onto TMDB's 20-item pages.
+    const skipN = Math.max(0, parseInt((extra && extra.skip) || "0", 10) || 0);
+    const tmdbPage = Math.min(500, Math.floor(skipN / 20) + 1);
     const params = new URLSearchParams(
-      Object.assign({}, def.query, { api_key: TMDB_API_KEY, page: "1", with_external_ids: "imdb_id" })
+      Object.assign({}, def.query, { api_key: TMDB_API_KEY, page: String(tmdbPage) })
     );
     const r = await fetch("https://api.themoviedb.org/3/discover/" + kind + "?" + params, {
       headers: { Accept: "application/json" },
@@ -857,7 +853,7 @@ async function catalog(type, id, extra) {
     const items = (data.results || []).map(function (o) {
       return Object.assign({}, o, { media_type: kind === "tv" ? "tv" : "movie" });
     });
-    return { metas: applySkip(await metasFor(items, type), extra) };
+    return { metas: await metasFor(items, type) };
   }
 
   const res = await fetch(PVR_BASE + def.path, {
@@ -881,8 +877,10 @@ async function catalog(type, id, extra) {
     if (!o.id) continue;
     normalised.push(o);
   }
-  return { metas: await metasFor(normalised, type) };
-  return { metas: metas };
+  // These pages are a single server-rendered list (?page= is ignored), so a
+  // scroll request past it must return nothing — returning the same list
+  // again made clients append the row to itself forever.
+  return { metas: applySkip(await metasFor(normalised, type), extra) };
 }
 
 /**
@@ -893,14 +891,14 @@ async function catalog(type, id, extra) {
  */
 // Per-provider cap. Stremio clients give up around 8s, so the slowest
 // provider must not drag the whole response past that.
-const PROVIDER_TIMEOUT_MS = 6000;
+const PROVIDER_TIMEOUT_MS = 8000;
 
 async function resolveStreams(type, rawId) {
   let id = rawId;
   let season = null;
   let episode = null;
 
-  if (type === "series") {
+  if (isSeriesType(type)) {
     const m = id.match(/^(.*):(\d+):(\d+)$/);
     if (m) {
       id = m[1];
@@ -928,7 +926,7 @@ async function resolveStreams(type, rawId) {
         // Stremio calls a series "series"; the providers expect Nuvio's "tv".
         // Without the translation the provider treated every series as a movie
         // and looked up the wrong TMDB result set, so no series ever resolved.
-        const providerType = type === "series" ? "tv" : type;
+        const providerType = isSeriesType(type) ? "tv" : "movie";
         const work = mod.getStreams(id, providerType, season, episode).then(function (v) {
           return v || [];
         });
@@ -954,7 +952,13 @@ async function resolveStreams(type, rawId) {
         url: st.url,
         quality: st.quality || "Auto",
         size: st.size && st.size !== "Unknown" ? st.size : undefined,
-        behaviorHints: { notWebReady: false, bingeGroup: r.p.name }
+        subtitles: (st.subtitles || []).map(function (sb, i) {
+          return { id: r.p.name + "-" + i, url: sb.url, lang: sb.lang || "Unknown" };
+        }),
+        behaviorHints: Object.assign(
+          { notWebReady: false, bingeGroup: r.p.name + "-" + (st.quality || "auto") },
+          st.headers ? { proxyHeaders: { request: st.headers } } : {}
+        )
       });
     }
   }
@@ -979,9 +983,11 @@ export default {
       // number; for series Stremio appends :season:episode.
       const str = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
       if (str) {
-        return cors(
-          JSON.stringify({ streams: await resolveStreams(str[1], decodeURIComponent(str[2])) })
-        );
+        const streams = await resolveStreams(str[1], decodeURIComponent(str[2]));
+        // Signed URLs expire, so cache only briefly; never cache an empty answer.
+        const resp = cors(JSON.stringify({ streams: streams }));
+        resp.headers.set("Cache-Control", streams.length ? "public, max-age=300" : "no-store");
+        return resp;
       }
       // /meta/<type>/<id>.json
       const mm = path.match(/^\/meta\/([^/]+)\/(.+?)\.json$/);

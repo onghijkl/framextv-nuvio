@@ -22,18 +22,25 @@
  *   origin check, no preflight, so cross-origin rules do not apply. The
  *   returned mirror URLs do send Access-Control-Allow-Origin: * anyway.
  *
- * Sources come back as hls (.m3u8), mp4 or dash (.mpd); the player handles
- * all three.
+ * cinemaos streams NDJSON (one source per line): every audio language and
+ * quality, as HLS or MP4. All of them are returned.
  */
 
+
 var PLAYER = "https://embed.reelsdownload.online";
-var SITE = "https://pvrplay.fun";
 var TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 var TIMEOUT_MS = 7000;
+// cinemaos regularly takes 8-11s; the old 7s cap threw those answers away
+// and returned nothing.
+var EXTRACT_TIMEOUT_MS = 12000;
+var HEDGE_AFTER_MS = 3000;
 var FILTER_BASE = "https://pvrplay-catalogs.pages.dev";
-var VALIDATE_TIMEOUT_MS = 3500;
-// How long to keep gathering sources after the first one arrives. Each extractor
-// can carry a different audio language, so a short wait is worth it.
+// HLS masters are fetched once to decide whether they need the codec filter.
+// The extractor already verified every source, so a slow check keeps the
+// source (unfiltered) instead of discarding it.
+var VALIDATE_TIMEOUT_MS = 2500;
+// How long to keep gathering after the first extractor answers. The fallback
+// extractors normally finish (found:false) before cinemaos does.
 var COLLECT_WINDOW_MS = 1500;
 
 var HEADERS = {
@@ -44,8 +51,8 @@ var HEADERS = {
 };
 
 /**
- * Extractor endpoints, in preference order. cinemaos answers most
- * consistently; the rest are kept as failover but usually return found:false.
+ * Extractor endpoints. cinemaos is the one that answers; the rest are kept
+ * as failover (they currently return found:false in ~1s, in parallel).
  */
 var EXTRACTORS = [
   "cinemaos-extract",
@@ -72,96 +79,107 @@ function qualityRank(q) {
   return m ? parseInt(m[1], 10) : 0;
 }
 
-function timedFetch(url, opts) {
+/**
+ * fetch with a timeout. The timer is always cleared so a finished request
+ * never keeps the runtime alive (that alone made runs take ~7s).
+ */
+function timedFetch(url, opts, timeoutMs) {
   var options = opts || {};
   if (!options.headers) options.headers = HEADERS;
+  var ms = timeoutMs || TIMEOUT_MS;
+  var timer = null;
   var work = fetch(url, options);
-  if (Promise && Promise.race) {
-    return Promise.race([
-      work,
-      new Promise(function (_, reject) {
-        setTimeout(function () {
-          reject(new Error("timeout"));
-        }, TIMEOUT_MS);
-      })
-    ]);
+  var cap = new Promise(function (_, reject) {
+    timer = setTimeout(function () {
+      reject(new Error("timeout"));
+    }, ms);
+  });
+  return Promise.race([work, cap]).then(
+    function (r) {
+      if (timer) clearTimeout(timer);
+      return r;
+    },
+    function (e) {
+      if (timer) clearTimeout(timer);
+      throw e;
+    }
+  );
+}
+
+/** Parse one JSON value, tolerating trailing junk after the first object. */
+function parseLoose(t) {
+  try {
+    return JSON.parse(t);
+  } catch (e) {
+    var depth = 0;
+    var inStr = false;
+    var esc = false;
+    for (var i = 0; i < t.length; i++) {
+      var c = t.charAt(i);
+      if (esc) { esc = false; continue; }
+      if (c === "\\") { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            return JSON.parse(t.slice(0, i + 1));
+          } catch (e2) {
+            return null;
+          }
+        }
+      }
+    }
+    return null;
   }
-  return work;
 }
 
 /**
- * Some responses carry trailing junk after the JSON object, so a plain
- * res.json() throws. Parse the first complete object instead.
+ * The extractors stream NDJSON: one {"source":{...}} per line, then
+ * {"done":true}. cinemaos sends ~12 lines (every audio language and
+ * quality). Reading only the first object — as this used to — kept one
+ * 480p English source and threw the other eleven away.
+ *
+ * Returns an array of parsed objects.
  */
-function readJsonLoose(res) {
-  if (!res || !res.ok) return null;
+function readJsonLines(res) {
+  if (!res || !res.ok) return Promise.resolve([]);
   return res
     .text()
     .then(function (t) {
-      if (!t) return null;
-      try {
-        return JSON.parse(t);
-      } catch (e) {
-        // Trim to the first balanced object.
-        var depth = 0;
-        var started = false;
-        for (var i = 0; i < t.length; i++) {
-          var c = t.charAt(i);
-          if (c === "{") {
-            depth++;
-            started = true;
-          } else if (c === "}") {
-            depth--;
-            if (started && depth === 0) {
-              try {
-                return JSON.parse(t.slice(0, i + 1));
-              } catch (e2) {
-                return null;
-              }
-            }
-          }
-        }
-        return null;
+      if (!t) return [];
+      var out = [];
+      var lines = t.split("\n");
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].trim();
+        if (!l) continue;
+        var d = parseLoose(l);
+        if (d) out.push(d);
       }
+      // Single pretty-printed object spanning several lines.
+      if (!out.length) {
+        var whole = parseLoose(t);
+        if (whole) out.push(whole);
+      }
+      return out;
     })
     .catch(function () {
-      return null;
+      return [];
     });
 }
 
 /* --------------------------------------------------------------- metadata */
 
-/** TMDB lookup: title, year and imdb id (the extractors want imdb). */
-function tmdbMeta(tmdbId, mediaType) {
-  var type = mediaType === "tv" ? "tv" : "movie";
-  var url =
-    "https://api.themoviedb.org/3/" + type + "/" + tmdbId +
-    "?api_key=" + TMDB_API_KEY + "&append_to_response=external_ids";
-  return timedFetch(url)
-    .then(function (r) {
-      return r && r.ok ? r.json() : null;
-    })
-    .then(function (d) {
-      if (!d) return null;
-      var date = type === "tv" ? d.first_air_date : d.release_date;
-      return {
-        title: (type === "tv" ? d.name : d.title) || "",
-        year: date ? String(date).slice(0, 4) : "",
-        imdbId: (d.external_ids && d.external_ids.imdb_id) || ""
-      };
-    })
-    .catch(function () {
-      return null;
-    });
-}
-
 function resolveTmdbId(tmdbId, mediaType) {
   var raw = String(tmdbId == null ? "" : tmdbId).trim();
   if (!raw) return Promise.resolve(null);
-  if (raw.toLowerCase().indexOf("tt") === 0) {
+  if (/^tt\d+$/i.test(raw)) {
     return timedFetch(
       "https://api.themoviedb.org/3/find/" + raw +
-        "?api_key=" + TMDB_API_KEY + "&external_source=imdb_id"
+        "?api_key=" + TMDB_API_KEY + "&external_source=imdb_id",
+      { headers: { Accept: "application/json" } }
     )
       .then(function (r) {
         return r && r.ok ? r.json() : null;
@@ -169,8 +187,7 @@ function resolveTmdbId(tmdbId, mediaType) {
       .then(function (d) {
         var res = d && (mediaType === "tv" ? d.tv_results : d.movie_results);
         if (res && res.length) return String(res[0].id);
-        var other = d && (d.movie_results || d.tv_results);
-        return other && other.length ? String(other[0].id) : null;
+        return null;
       })
       .catch(function () {
         return null;
@@ -182,26 +199,22 @@ function resolveTmdbId(tmdbId, mediaType) {
 
 /* ------------------------------------------------------------- extraction */
 
-/** Resolve a possibly-relative URL against a base. */
-function absUrl(base, rel) {
-  if (rel.indexOf("http://") === 0 || rel.indexOf("https://") === 0) return rel;
-  var m = base.match(/^(https?:\/\/[^\/]+)/);
-  var origin = m ? m[1] : "";
-  if (rel.charAt(0) === "/") return origin + rel;
-  return base.substring(0, base.lastIndexOf("/") + 1) + rel;
+function isHlsSource(s) {
+  return s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("ios-hls") !== -1;
 }
 
-
 /**
- * Validate a source and reduce it to something playable: drop what does not
- * answer, and for HLS return a single suitable variant instead of the master.
- * Returns the adjusted source, or null to discard.
- */
-/**
- * Does this master contain anything the device should not be offered?
+ * Would the playlist filter actually change anything?
+ *
+ * Only when some variants must go (HEVC, over the height or bitrate cap) AND
+ * at least one survives. These ladders are often HEVC-only; the Worker then
+ * keeps every variant anyway, so routing through it was a pointless extra hop.
  */
 function needsFilter(text) {
   var cap = getStreams.maxHeight || 1080;
+  var maxBw = getStreams.maxBitrate || 12000000;
+  var kept = 0;
+  var dropped = 0;
   var lines = text.split("\n");
   for (var i = 0; i < lines.length; i++) {
     var l = lines[i];
@@ -209,192 +222,244 @@ function needsFilter(text) {
     var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
     var h = res ? parseInt(res[2], 10) : 0;
     var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
-    if (/hvc1|hev1/i.test(cod)) return true;
-    if (h && h > cap) return true;
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+    if (/hvc1|hev1/i.test(cod) || (h && h > cap) || (bw && bw > maxBw)) dropped++;
+    else kept++;
   }
-  return false;
+  return dropped > 0 && kept > 0;
 }
 
 /**
- * Validate a source and reduce it to something playable: drop what does not
- * answer, drop error pages, and route masters through the playlist filter.
+ * Validate an HLS source and route it through the playlist filter when that
+ * helps. Non-HLS sources pass straight through (the extractor verified them).
  *
- * The master is filtered rather than replaced by a single variant because these
- * ladders declare audio as a separate rendition referenced by AUDIO="..." —
- * a variant playlist on its own has no audio reference and plays silently.
- *
- * Returns the adjusted source, or null to discard.
+ * The master is filtered rather than replaced by one variant: audio is a
+ * separate rendition referenced by AUDIO="...", so a lone variant is silent.
  */
 function prepareSource(s) {
-  var isHls =
-    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("ios-hls") !== -1;
-
-  if (!isHls) return Promise.resolve(s);
+  if (!isHlsSource(s)) return Promise.resolve(s);
 
   return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
     .then(function (r) {
-      if (!r || !r.ok) return null;
+      if (!r) return s.verified ? s : null;
+      if (!r.ok) return null;
       return r.text().then(function (t) {
-        if (t.indexOf("#EXTM3U") === -1) return s;
-
+        if (t.indexOf("#EXTM3U") === -1) return null;
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
         if (!isMaster && t.indexOf("#EXTINF") === -1) return null;
-
         if (isMaster && needsFilter(t)) {
-          return {
-            url: (getStreams.filterBase || FILTER_BASE) +
-              "/hls?u=" + encodeURIComponent(s.url) +
-              "&cap=" + (getStreams.maxHeight || 1080),
-            quality: s.quality,
-            scraperName: s.scraperName,
-            label: s.label,
-            tracks: s.tracks
-          };
+          var copy = {};
+          for (var k in s) copy[k] = s[k];
+          copy.url = (getStreams.filterBase || FILTER_BASE) +
+            "/hls?u=" + encodeURIComponent(s.url) +
+            "&cap=" + (getStreams.maxHeight || 1080) +
+            "&maxbw=" + (getStreams.maxBitrate || 12000000);
+          return copy;
         }
         return s;
       });
     })
     .catch(function () {
-      return null;
+      // Timeout / network blip: the extractor already verified it.
+      return s.verified ? s : null;
     });
 }
 
-/** One extractor call. Returns a normalized stream, or null. */
-function tryExtractor(endpoint, tmdbId, mediaType, season, episode, meta) {
-  var params = {
-    type: mediaType,
-    tmdb_id: tmdbId,
-    title: meta.title,
-    year: meta.year,
-    imdb_id: meta.imdbId,
-    platform: "ios"
+/** Normalise one raw extractor source, or null. */
+function normaliseSource(s) {
+  if (!s || !s.url || typeof s.url !== "string") return null;
+  return {
+    url: s.url.charAt(0) === "/" ? PLAYER + s.url : s.url,
+    quality: s.quality,
+    scraperName: s.scraperName,
+    label: s.label,
+    type: s.type,
+    verified: !!s.verified,
+    latencyMs: s.latencyMs == null ? null : s.latencyMs,
+    tracks: s.tracks
   };
+}
+
+/**
+ * Hedged request for the primary extractor.
+ *
+ * cinemaos's response time is wildly uneven for the same title (measured
+ * 2.6s, 5.8s, 10.9s back to back) and the delay is server-side — headers
+ * arrive late, so nothing can be read early. Firing a second identical
+ * request after HEDGE_AFTER_MS and taking whichever brings sources first
+ * cuts the tail roughly in half without loading the upstream on fast calls.
+ */
+function hedgedFetchLines(url) {
+  return new Promise(function (resolve) {
+    var done = false;
+    var inFlight = 0;
+    var hedgeTimer = null;
+
+    function hasSource(objs) {
+      for (var i = 0; i < objs.length; i++) {
+        if (objs[i] && (objs[i].source || (objs[i].sources && objs[i].sources.length))) return true;
+      }
+      return false;
+    }
+
+    function settle(objs) {
+      inFlight--;
+      if (done) return;
+      if (hasSource(objs) || inFlight === 0) {
+        done = true;
+        if (hedgeTimer) clearTimeout(hedgeTimer);
+        resolve(objs);
+      }
+    }
+
+    function fire() {
+      inFlight++;
+      timedFetch(url, null, EXTRACT_TIMEOUT_MS)
+        .then(readJsonLines)
+        .then(settle, function () { settle([]); });
+    }
+
+    fire();
+    hedgeTimer = setTimeout(function () {
+      hedgeTimer = null;
+      if (!done) fire();
+    }, HEDGE_AFTER_MS);
+  });
+}
+
+/** One extractor call. Returns every source it offered (possibly []). */
+function tryExtractor(endpoint, tmdbId, mediaType, season, episode) {
+  var params = { type: mediaType, tmdb_id: tmdbId, platform: "ios" };
   if (mediaType === "tv") {
     params.season = season;
     params.episode = episode;
   }
 
-  return timedFetch(PLAYER + "/api/" + endpoint + "?" + qs(params))
-    .then(readJsonLoose)
-    .then(function (d) {
-      if (!d) return null;
+  var url = PLAYER + "/api/" + endpoint + "?" + qs(params);
+  var call = endpoint === EXTRACTORS[0] ? hedgedFetchLines(url) : timedFetch(url).then(readJsonLines);
 
-      // Two shapes: a single {source:{...}} or a {sources:[...]} list.
-      var list = [];
-      if (d.source && d.source.url) list.push(d.source);
-      if (d.sources && d.sources.length) list = list.concat(d.sources);
-      if (!list.length) return null;
-
-      var best = null;
-      for (var i = 0; i < list.length; i++) {
-        var s = list[i];
-        if (!s || !s.url || typeof s.url !== "string") continue;
-        if (!best || qualityRank(s.quality) > qualityRank(best.quality)) best = s;
+  return call
+    .then(function (objs) {
+      var out = [];
+      for (var i = 0; i < objs.length; i++) {
+        var d = objs[i];
+        if (!d) continue;
+        if (d.source) out.push(d.source);
+        if (d.sources && d.sources.length) out = out.concat(d.sources);
       }
-      if (!best) return null;
-
-      // The extractors return root-relative paths for their own HLS proxy
-      // (/api/ios-hls/master.m3u8?src=...). A player needs an absolute URL.
-      if (best.url.charAt(0) === "/") {
-        best = {
-          url: PLAYER + best.url,
-          quality: best.quality,
-          scraperName: best.scraperName,
-          label: best.label,
-          type: best.type,
-          // Keep the subtitle tracks; dropping them here would lose them.
-          tracks: best.tracks
-        };
+      var norm = [];
+      for (var j = 0; j < out.length; j++) {
+        var n = normaliseSource(out[j]);
+        if (n) norm.push(n);
       }
-      return best;
+      return norm;
     })
     .catch(function () {
-      return null;
+      return [];
     });
 }
 
-/**
- * Fan out across the extractors, in parallel. The site does the same.
- *
- * Timing matters here: cinemaos usually answers in ~1.7s while vidrift can
- * take 7s+ and still return nothing. Running them sequentially meant a slow
- * miss could delay a fast hit. Racing them all and taking the best answer
- * costs one round-trip instead of four.
- */
-function extract(tmdbId, mediaType, season, episode, meta) {
-  // The extractors need only id and type; title/year/imdb are optional.
-  //
-  // Collect from EVERY extractor rather than stopping at the first answer.
-  // Each extractor can carry a different audio language, so returning early —
-  // as this used to — threw away the other languages the site's own player
-  // offers. A short collection window keeps a slow straggler from delaying the
-  // result: once one source has arrived, the rest get a bounded grace period.
+/** Fan out across extractors in parallel; collect with a bounded window. */
+function gather(tmdbId, mediaType, season, episode) {
   return new Promise(function (resolve) {
     var pending = EXTRACTORS.length;
     var results = [];
     var finished = false;
-    var window = null;
+    var windowTimer = null;
 
     function finish() {
       if (finished) return;
       finished = true;
-      if (window) clearTimeout(window);
+      if (windowTimer) clearTimeout(windowTimer);
       resolve(results);
     }
 
-    function collect(s) {
+    function collect(list) {
       pending--;
-      if (s && s.url) {
-        results.push(s);
-        if (!window) window = setTimeout(finish, COLLECT_WINDOW_MS);
+      if (list && list.length) {
+        results = results.concat(list);
+        if (!windowTimer && pending > 0) windowTimer = setTimeout(finish, COLLECT_WINDOW_MS);
       }
       if (pending === 0) finish();
     }
 
     EXTRACTORS.forEach(function (ep) {
-      tryExtractor(ep, tmdbId, mediaType, season, episode, meta)
-        .then(collect)
-        .catch(function () {
-          collect(null);
-        });
-    });
-  }).then(function (valid) {
-    if (!valid.length) return [];
-
-    var checks = valid.map(function (s) {
-      return prepareSource(s).then(function (p) {
-        return p && p.url ? p : null;
+      tryExtractor(ep, tmdbId, mediaType, season, episode).then(collect, function () {
+        collect(null);
       });
     });
+  });
+}
 
-    return settleFast(checks, 1, 700).then(function (prepared) {
-      var seen = {};
+/** "Beta - Hindi" -> "Hindi". */
+function languageOf(label) {
+  var s = String(label || "");
+  var i = s.indexOf(" - ");
+  return (i === -1 ? s : s.slice(i + 3)).trim();
+}
+
+function languageRank(lang) {
+  var pref = getStreams.preferredLanguages || [];
+  var l = String(lang || "").toLowerCase();
+  for (var i = 0; i < pref.length; i++) {
+    if (l.indexOf(String(pref[i]).toLowerCase()) !== -1) return i;
+  }
+  return pref.length;
+}
+
+/** Subtitle tracks are shared across sources; build the list once. */
+function subtitlesFrom(sources) {
+  var seen = {};
+  var subs = [];
+  for (var i = 0; i < sources.length; i++) {
+    var tr = sources[i].tracks || [];
+    for (var j = 0; j < tr.length; j++) {
+      var tk = tr[j];
+      if (!tk || !tk.url) continue;
+      var url = tk.url.indexOf("http") === 0 ? tk.url : PLAYER + tk.url;
+      if (seen[url]) continue;
+      seen[url] = true;
+      subs.push({ url: url, lang: tk.label || tk.lang || "Unknown" });
+    }
+  }
+  return subs;
+}
+
+function extract(tmdbId, mediaType, season, episode) {
+  return gather(tmdbId, mediaType, season, episode).then(function (raw) {
+    // Same URL from two extractors: keep the first.
+    var seen = {};
+    var unique = [];
+    for (var i = 0; i < raw.length; i++) {
+      if (seen[raw[i].url]) continue;
+      seen[raw[i].url] = true;
+      unique.push(raw[i]);
+    }
+    if (!unique.length) return [];
+
+    var subs = subtitlesFrom(unique);
+
+    // Each check is bounded by VALIDATE_TIMEOUT_MS, so Promise.all is safe —
+    // the old 700ms "settle fast" window dropped every HLS source whenever an
+    // MP4 (no check needed) resolved first.
+    return Promise.all(unique.map(prepareSource)).then(function (prepared) {
       var out = [];
-      for (var i = 0; i < prepared.length; i++) {
-        var s = prepared[i];
-        if (!s || !s.url || seen[s.url]) continue;
-        seen[s.url] = true;
-        // tracks carry the subtitle renditions the player would otherwise
-        // get; the URL is relative to the player origin.
-        var subs = [];
-        var tr = s.tracks || [];
-        for (var ti = 0; ti < tr.length; ti++) {
-          var tk = tr[ti];
-          if (!tk || !tk.url) continue;
-          subs.push({
-            url: tk.url.indexOf("http") === 0 ? tk.url : PLAYER + tk.url,
-            lang: tk.lang || tk.label || "Unknown"
-          });
-        }
+      for (var k = 0; k < prepared.length; k++) {
+        var s = prepared[k];
+        if (!s || !s.url) continue;
+        var lang = languageOf(s.label);
+        var fmt = isHlsSource(s) ? "HLS" : s.type ? String(s.type).toUpperCase() : "";
         out.push({
-          _verified: !!s.verified,
-          _latency: s.latencyMs == null ? null : s.latencyMs,
+          _lr: languageRank(lang),
+          _q: qualityRank(s.quality),
+          _hls: fmt === "HLS" ? 1 : 0,
+          _v: s.verified ? 1 : 0,
+          _lat: s.latencyMs == null ? 99999 : s.latencyMs,
           name: "ongserv2",
-          // label carries the audio variant ("Alpha - English") - the
-          // 4KHDHub-style detail worth showing.
           title: "ongserv2 \u2022 " + (s.quality || "Auto") +
-            (s.label ? " \u2022 " + s.label : "") +
-            (s.scraperName ? " \u2022 " + s.scraperName : ""),
+            (lang ? " \u2022 " + lang : "") +
+            (fmt ? " \u2022 " + fmt : "") +
+            (s.label && s.label !== lang ? " (" + s.label.split(" - ")[0] + ")" : ""),
           url: s.url,
           quality: s.quality || "Auto",
           size: "Unknown",
@@ -402,59 +467,18 @@ function extract(tmdbId, mediaType, season, episode, meta) {
           subtitles: subs
         });
       }
-      // The extractor reports how long it took (latencyMs) and whether the
-      // source was verified. Ordering by those puts the quickest, most
-      // trustworthy source at the top instead of whichever answered first.
+      // Preferred language first, then best quality, then verified/fastest.
       out.sort(function (a, b) {
-        var av = a._verified ? 1 : 0;
-        var bv = b._verified ? 1 : 0;
-        if (av !== bv) return bv - av;
-        var al = a._latency == null ? 99999 : a._latency;
-        var bl = b._latency == null ? 99999 : b._latency;
-        if (al !== bl) return al - bl;
-        return qualityRank(b.quality) - qualityRank(a.quality);
+        return (a._lr - b._lr) || (b._q - a._q) || (b._v - a._v) ||
+          (b._hls - a._hls) || (a._lat - b._lat);
       });
-      for (var ci = 0; ci < out.length; ci++) {
-        delete out[ci]._verified;
-        delete out[ci]._latency;
+      var max = getStreams.maxResults || 0;
+      if (max > 0 && out.length > max) out = out.slice(0, max);
+      for (var c = 0; c < out.length; c++) {
+        delete out[c]._lr; delete out[c]._q; delete out[c]._hls;
+        delete out[c]._v; delete out[c]._lat;
       }
       return out;
-    });
-  });
-}
-
-/**
- * Resolve as soon as one source has validated, instead of waiting for every
- * check. A single dead source used to hold up the result for the full timeout
- * even when another had already come back good.
- */
-function settleFast(promises, minSources, graceMs) {
-  return new Promise(function (resolve) {
-    var good = [];
-    var settled = 0;
-    var timer = null;
-    var finished = false;
-
-    function finish() {
-      if (finished) return;
-      finished = true;
-      if (timer) clearTimeout(timer);
-      resolve(good);
-    }
-
-    if (!promises.length) return finish();
-
-    promises.forEach(function (p) {
-      p.then(function (v) {
-        settled++;
-        if (v) good.push(v);
-        if (settled === promises.length) return finish();
-        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
-      }).catch(function () {
-        settled++;
-        if (settled === promises.length) return finish();
-        if (good.length >= minSources && !timer) timer = setTimeout(finish, graceMs);
-      });
     });
   });
 }
@@ -462,33 +486,33 @@ function settleFast(promises, minSources, graceMs) {
 /* ------------------------------------------------------------------ entry */
 
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
-  var type = mediaType === "tv" ? "tv" : "movie";
+  var type = mediaType === "tv" || mediaType === "series" ? "tv" : "movie";
   var season = parseInt(seasonNum, 10) || 1;
   var episode = parseInt(episodeNum, 10) || 1;
 
   return resolveTmdbId(tmdbId, type)
     .then(function (id) {
       if (!id) return [];
-      // The extractors need only id and type — title, year and imdb are
-      // optional and ignored in practice. Skipping the TMDB lookup removes a
-      // round-trip from every request.
-      return extract(id, type, season, episode, {});
+      return extract(id, type, season, episode);
     })
     .catch(function () {
       return [];
     });
 }
 
-getStreams.loose = false;
 getStreams.maxHeight = 1080;
 getStreams.maxBitrate = 12000000;
 getStreams.filterBase = FILTER_BASE;
+getStreams.preferredLanguages = ["English", "Hindi"];
+getStreams.maxResults = 0; // 0 = no cap
 
 if (typeof globalThis !== "undefined") {
   globalThis.__ONGserv2 = { getStreams: getStreams };
 }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
-} else {
+} else if (typeof global !== "undefined") {
   global.getStreams = getStreams;
+} else if (typeof globalThis !== "undefined") {
+  globalThis.getStreams = getStreams;
 }

@@ -311,6 +311,8 @@ if (typeof globalThis !== "undefined") {
 }
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
-} else {
+} else if (typeof global !== "undefined") {
   global.getStreams = getStreams;
+} else if (typeof globalThis !== "undefined") {
+  globalThis.getStreams = getStreams;
 }

@@ -1,6 +1,6 @@
 {
   "name": "ong's Repo",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Stream providers for Nuvio",
   "author": "ong",
   "scrapers": [
@@ -29,7 +29,7 @@
       "id": "pvrplay",
       "name": "ONGserv2",
       "description": "Multi-extractor pipeline. HLS, MP4 and DASH sources.",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "author": "ong",
       "filename": "providers/pvrplay.js",
       "supportedTypes": [
