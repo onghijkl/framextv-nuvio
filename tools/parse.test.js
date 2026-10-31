@@ -262,6 +262,52 @@ async function main() {
     assert.strictEqual(P.languageOf(undefined), "");
   });
 
+  // The relay hop cinemaos puts in front of every alternate-audio source is a
+  // CORS proxy and nothing else. If it survives into the emitted link, every
+  // language shares a long identical prefix and the client shows three
+  // different streams as "the same link" over and over.
+  const RELAY = "https://cinemaos-relay.hzxdfx7.workers.dev/?url=";
+  const MEDIA = "https://holly.mpddash.workers.dev/p/" + "A".repeat(40);
+  const OTHER = MEDIA.replace("A".repeat(40), "B".repeat(40));
+  const wrap = function (m) {
+    return "https://embed.reelsdownload.online/api/ios-hls/master.m3u8?src=" +
+      encodeURIComponent(RELAY + encodeURIComponent(m));
+  };
+  const SHORT_PREFIX = "https://embed.reelsdownload.online/api/ios-hls/master.m3u8?src=";
+
+  await test("unwrapProxy drops the CORS-only relay hop", function () {
+    assert.strictEqual(P.unwrapProxy(wrap(MEDIA)), SHORT_PREFIX + encodeURIComponent(MEDIA));
+  });
+
+  await test("unwrapProxy leaves a plain link alone", function () {
+    assert.strictEqual(P.unwrapProxy(MEDIA), MEDIA);
+  });
+
+  await test("two languages stop sharing one identical link", function () {
+    const a = P.unwrapProxy(wrap(MEDIA));
+    const b = P.unwrapProxy(wrap(OTHER));
+    assert.notStrictEqual(a, b);
+    let same = 0;
+    while (same < a.length && a[same] === b[same]) same++;
+    assert.ok(same < SHORT_PREFIX.length + 60,
+      "distinguishing part must move up into the visible prefix (shared " + same + " chars)");
+  });
+
+  await test("edition/signature variants collapse to one media key", function () {
+    const x = "https://bcdnt.hakunaymatata.com/resource/deadbeef.mp4?sign=aaa&t=111";
+    const y = "https://bcdnt.hakunaymatata.com/resource/deadbeef.mp4?sign=bbb&t=222";
+    assert.strictEqual(P.mediaKey(x), P.mediaKey(y));
+    assert.notStrictEqual(P.mediaKey(x), P.mediaKey(y.replace("deadbeef", "cafe1234")));
+  });
+
+  await test("mediaKey unwraps the relay hop as well", function () {
+    assert.strictEqual(
+      P.mediaKey(wrap(MEDIA)),
+      P.mediaKey(SHORT_PREFIX + encodeURIComponent(MEDIA))
+    );
+    assert.notStrictEqual(P.mediaKey(wrap(MEDIA)), P.mediaKey(wrap(OTHER)));
+  });
+
   console.log(
     "\n[parse.test] " + passed + " passed" +
       (process.exitCode ? ", FAILURES above" : "")

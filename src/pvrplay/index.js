@@ -197,6 +197,96 @@ function resolveTmdbId(tmdbId, mediaType) {
   return Promise.resolve(isFinite(n) && n > 0 ? String(n) : null);
 }
 
+/* ----------------------------------------------------------- link identity */
+
+// cinemaos ships every alternate-audio source through the same converter
+// endpoint:  <PLAYER>/api/ios-hls/master.m3u8?src=<relay>?url=<media>
+// The relay hop only exists to add CORS headers, and it prefixes *all* of them
+// with ~120 identical characters — so a client that shows (or truncates) the
+// link renders three different languages as "the same link" three times.
+// Nuvio's plugin fetch is not a browser fetch (no origin, no preflight), and
+// the converter fetches server side where CORS does not apply either, so the
+// hop can go and the real media target is kept.
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(String(value).replace(/\+/g, " "));
+  } catch (e) {
+    return null;
+  }
+}
+
+function isProxyKey(key) {
+  return key === "src" || key === "url" || key === "u";
+}
+
+function nestedTarget(value) {
+  var at = value.indexOf("?");
+  if (at < 0) return null;
+  var params = value.slice(at + 1).split("&");
+  for (var i = 0; i < params.length; i++) {
+    var eq = params[i].indexOf("=");
+    if (eq < 0) continue;
+    if (!isProxyKey(params[i].slice(0, eq).toLowerCase())) continue;
+    var inner = safeDecode(params[i].slice(eq + 1));
+    if (inner && /^https?:\/\//i.test(inner)) return inner;
+  }
+  return null;
+}
+
+// Collapse one proxy hop: <endpoint>?...&src=<relay?url=<media>> → src=<media>.
+function unwrapOnce(url) {
+  var at = url.indexOf("?");
+  if (at < 0) return null;
+  var base = url.slice(0, at);
+  var params = url.slice(at + 1).split("&");
+  for (var i = 0; i < params.length; i++) {
+    var eq = params[i].indexOf("=");
+    if (eq < 0) continue;
+    var key = params[i].slice(0, eq);
+    if (!isProxyKey(key.toLowerCase())) continue;
+    var hop = safeDecode(params[i].slice(eq + 1));
+    if (!hop || !/^https?:\/\//i.test(hop)) continue;
+    var target = nestedTarget(hop);
+    if (!target) continue;
+    params[i] = key + "=" + encodeURIComponent(target);
+    var out = base + "?" + params.join("&");
+    return out === url ? null : out;
+  }
+  return null;
+}
+
+function unwrapProxy(url) {
+  var current = String(url == null ? "" : url);
+  for (var hop = 0; hop < 4; hop++) {
+    var next = unwrapOnce(current);
+    if (!next) break;
+    current = next;
+  }
+  return current;
+}
+
+// Same media served twice (different relay, different signature) must collapse
+// to one stream. Expiring/one-shot params are dropped from the identity, the
+// proxy chain is unwrapped, and the remainder is compared case-insensitively.
+var VOLATILE_PARAMS = {
+  sign: 1, signature: 1, sig: 1, t: 1, ts: 1, exp: 1, expires: 1,
+  token: 1, hdnts: 1, policy: 1, key: 1, auth: 1
+};
+
+function mediaKey(url) {
+  var value = unwrapProxy(url).toLowerCase();
+  var at = value.indexOf("?");
+  if (at < 0) return value;
+  var keep = [];
+  var params = value.slice(at + 1).split("&");
+  for (var i = 0; i < params.length; i++) {
+    var key = params[i].split("=")[0];
+    if (VOLATILE_PARAMS[key]) continue;
+    keep.push(params[i]);
+  }
+  return value.slice(0, at) + (keep.length ? "?" + keep.join("&") : "");
+}
+
 /* ------------------------------------------------------------- extraction */
 
 function isHlsSource(s) {
@@ -237,7 +327,24 @@ function needsFilter(text) {
  * separate rendition referenced by AUDIO="...", so a lone variant is silent.
  */
 function prepareSource(s) {
-  if (!isHlsSource(s)) return Promise.resolve(s);
+  if (!isHlsSource(s)) {
+    var plain = unwrapProxy(s.url);
+    if (plain === s.url) return Promise.resolve(s);
+    var clone = {};
+    for (var k in s) clone[k] = s[k];
+    clone.url = plain;
+    return Promise.resolve(clone);
+  }
+
+  // Strip the CORS-only relay hop before validating, so the link we emit is the
+  // short form and the media target is what actually appears in the URL.
+  var direct = unwrapProxy(s.url);
+  if (direct !== s.url) {
+    var copy = {};
+    for (var key in s) copy[key] = s[key];
+    copy.url = direct;
+    s = copy;
+  }
 
   return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
     .then(function (r) {
@@ -445,12 +552,14 @@ function subtitlesFrom(sources) {
 
 function extract(tmdbId, mediaType, season, episode) {
   return gather(tmdbId, mediaType, season, episode).then(function (raw) {
-    // Same URL from two extractors: keep the first.
+    // Same media from two extractors — or the same source re-wrapped in a
+    // different relay / re-signed — is one stream, keep the first.
     var seen = {};
     var unique = [];
     for (var i = 0; i < raw.length; i++) {
-      if (seen[raw[i].url]) continue;
-      seen[raw[i].url] = true;
+      var rawKey = mediaKey(raw[i].url);
+      if (seen[rawKey]) continue;
+      seen[rawKey] = true;
       unique.push(raw[i]);
     }
     if (!unique.length) return [];
@@ -462,9 +571,15 @@ function extract(tmdbId, mediaType, season, episode) {
     // MP4 (no check needed) resolved first.
     return Promise.all(unique.map(prepareSource)).then(function (prepared) {
       var out = [];
+      var emitted = {};
       for (var k = 0; k < prepared.length; k++) {
         var s = prepared[k];
         if (!s || !s.url) continue;
+        // prepareSource can rewrite a link (filter route, unwrapped relay); make
+        // sure two sources never end up as the same link twice in the list.
+        var outKey = mediaKey(s.url);
+        if (emitted[outKey]) continue;
+        emitted[outKey] = true;
         var lang = languageOf(s.label);
         var fmt = isHlsSource(s) ? "HLS" : s.type ? String(s.type).toUpperCase() : "";
         out.push({
@@ -536,7 +651,9 @@ if (typeof module !== "undefined" && module.exports) {
       readJsonLines: readJsonLines,
       needsFilter: needsFilter,
       qualityRank: qualityRank,
-      languageOf: languageOf
+      languageOf: languageOf,
+      unwrapProxy: unwrapProxy,
+      mediaKey: mediaKey
     }
   };
 } else if (typeof global !== "undefined") {
