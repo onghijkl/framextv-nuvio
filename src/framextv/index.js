@@ -73,23 +73,31 @@ function qualityRank(q) {
   return m ? parseInt(m[1], 10) : 0;
 }
 
-/** fetch with hard timeout; the runtime gives no AbortController guarantee. */
+/**
+ * fetch with a hard timeout. The timer is always cleared, so a request that
+ * has already answered never keeps the runtime alive waiting on it.
+ */
 function timedFetch(url, opts, ms) {
   var options = opts || {};
   if (!options.headers) options.headers = HEADERS;
   var limit = ms || TIMEOUT_MS;
+  var timer = null;
   var work = fetch(url, options);
-  if (typeof Promise !== "undefined" && Promise.race) {
-    return Promise.race([
-      work,
-      new Promise(function (_, reject) {
-        setTimeout(function () {
-          reject(new Error("timeout"));
-        }, limit);
-      })
-    ]);
-  }
-  return work;
+  var cap = new Promise(function (_, reject) {
+    timer = setTimeout(function () {
+      reject(new Error("timeout"));
+    }, limit);
+  });
+  return Promise.race([work, cap]).then(
+    function (r) {
+      if (timer) clearTimeout(timer);
+      return r;
+    },
+    function (e) {
+      if (timer) clearTimeout(timer);
+      throw e;
+    }
+  );
 }
 
 function readJson(res) {
@@ -355,25 +363,33 @@ function hedgedFetch(url, ms, hedgeAfterMs) {
   return new Promise(function (resolve, reject) {
     var settled = false;
     var failures = 0;
+    var hedgeTimer = null;
+
+    function done() {
+      settled = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      hedgeTimer = null;
+    }
 
     function run() {
       timedFetch(url, null, ms)
         .then(function (r) {
           if (settled) return;
-          settled = true;
+          done();
           resolve(r);
         })
         .catch(function (e) {
           failures++;
           if (!settled && failures >= 2) {
-            settled = true;
+            done();
             reject(e);
           }
         });
     }
 
     run();
-    setTimeout(function () {
+    hedgeTimer = setTimeout(function () {
+      hedgeTimer = null;
       if (!settled) run();
     }, hedgeAfterMs);
   });

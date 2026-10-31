@@ -92,6 +92,73 @@ const CATALOGS = [
 /** Public TMDB key — the same one the source sites embed in their clients. */
 const TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49";
 
+/* ------------------------------------------------------------- /hls guard */
+
+/** Media playlists run to a few hundred KB; nothing legitimate here is bigger. */
+const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Addresses that must never be fetched on a caller's behalf: loopback, the
+ * link-local metadata range, and the private / unique-local ranges.
+ *
+ * The numeric ranges are tested only against a bare IP literal, so a real
+ * hostname like "10.cdn.example.com" is not caught by the 10.x rule.
+ */
+function isPrivateHost(host) {
+  const h = String(host).toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h === "::1" || /^f[cd][0-9a-f]{2}:/.test(h)) return true;
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!v4) return false;
+  const a = Number(v4[1]);
+  const b = Number(v4[2]);
+  return (
+    a === 0 || a === 10 || a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127)
+  );
+}
+
+/**
+ * Decide whether /hls may fetch `target`. Returns a refusal string, or null to
+ * allow.
+ *
+ * Why this exists: /hls fetches a URL the caller supplies. Unguarded, the
+ * Worker is an open fetch proxy — anyone can spend this account's request quota
+ * and reach hosts from Cloudflare's network instead of their own.
+ *
+ * shortcut: the host allowlist is opt-in through the HLS_ALLOW binding, because
+ * the upstream CDN hostnames cannot be known from this repo — the extractors
+ * return whatever host they please. Once a live run shows which hosts actually
+ * appear, set HLS_ALLOW to that comma-separated list and this becomes a closed
+ * allowlist. Until then only the dangerous destinations are refused.
+ */
+function hlsTargetRefusal(target, env) {
+  let u;
+  try {
+    u = new URL(target);
+  } catch (e) {
+    return "u is not a url";
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "scheme not allowed";
+  if (isPrivateHost(u.hostname)) return "host not allowed";
+
+  const allow = String((env && env.HLS_ALLOW) || "")
+    .split(",")
+    .map(function (s) { return s.trim().toLowerCase(); })
+    .filter(Boolean);
+  if (allow.length) {
+    const host = u.hostname.toLowerCase();
+    const ok = allow.some(function (a) {
+      return host === a || host.endsWith("." + a);
+    });
+    if (!ok) return "host not allowed";
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ parse */
 
 /** Concatenate and unescape the RSC payload chunks. */
@@ -289,7 +356,13 @@ async function filterPlaylist(target, cap, maxBw) {
   });
   if (!res.ok) return null;
 
+  // A playlist is small. Anything large is not one, and proxying it would
+  // spend this account's bandwidth on something the player never asked for.
+  const declared = parseInt(res.headers.get("content-length") || "0", 10);
+  if (declared && declared > MAX_PLAYLIST_BYTES) return null;
+
   const text = await res.text();
+  if (text.length > MAX_PLAYLIST_BYTES) return null;
   if (text.indexOf("#EXTM3U") === -1) return null;
 
   // A media playlist needs no filtering and must be handed back untouched.
@@ -427,8 +500,7 @@ async function meta(type, rawId) {
     );
     if (!f.ok) return { meta: null };
     const found = await f.json();
-    const list =
-      type === "series" ? found.tv_results : found.movie_results;
+    const list = isSeriesType(type) ? found.tv_results : found.movie_results;
     if (!list || !list.length) return { meta: null };
     id = String(list[0].id);
   } else {
@@ -701,7 +773,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.6.0",
+    version: "1.6.1",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -966,7 +1038,7 @@ async function resolveStreams(type, rawId) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
@@ -1012,6 +1084,9 @@ export default {
         const maxBw = parseInt(url.searchParams.get("maxbw") || "12000000", 10) || 12000000;
         if (!target) return cors(JSON.stringify({ error: "missing u" }), 400);
 
+        const refusal = hlsTargetRefusal(target, env);
+        if (refusal) return cors(JSON.stringify({ error: refusal }), 403);
+
         const filtered = await filterPlaylist(target, cap, maxBw);
         if (filtered === null) {
           return new Response("upstream playlist unavailable", { status: 502 });
@@ -1051,4 +1126,18 @@ export default {
       return cors(JSON.stringify({ error: String(e && e.message ? e.message : e) }), 500);
     }
   }
+};
+
+// Named export for tools/parse.test.js. Workers only ever reads `default`.
+export const _test = {
+  rscPayload,
+  extractArray,
+  balancedArray,
+  parseHomeRows,
+  filterPlaylist,
+  hlsTargetRefusal,
+  isPrivateHost,
+  applySkip,
+  isSeries,
+  toMeta
 };

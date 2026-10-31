@@ -40,7 +40,7 @@ export default {
       /^\/stream\/[^/]+\/.+\.json$/.test(path);
 
     if (isAddonRoute) {
-      return worker.fetch(request);
+      return worker.fetch(request, env);
     }
 
     // Pages requires the Worker to forward anything it does not handle.

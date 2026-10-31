@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 .signing.env
 out/
+addon/worker.gen.mjs
