@@ -26,6 +26,11 @@ jobs:
             exit 1
           fi
 
+      # Offline. Fails when the parsing or playlist-filter logic regresses,
+      # independently of whether any upstream site is reachable.
+      - name: Parser tests
+        run: node tools/parse.test.js
+
       - name: Manifest sanity
         run: |
           node -e '
@@ -51,9 +56,11 @@ jobs:
           node tools/test.js 1288069 movie | tee /tmp/pos1.txt
           node tools/test.js 1396 tv 1 1 | tee /tmp/pos2.txt
           node tools/test.js 550 movie --provider=pvrplay | tee /tmp/pos3.txt
-          ! grep -q "\] 0 stream(s)" /tmp/pos3.txt
-          grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos1.txt
-          grep -q "1 stream(s)\|2 stream(s)\|3 stream(s)\|4 stream(s)" /tmp/pos2.txt
+          # "at least one stream". The old per-count alternation failed a
+          # healthy run of 5-10 streams and passed 12 only by substring luck.
+          for f in /tmp/pos1.txt /tmp/pos2.txt /tmp/pos3.txt; do
+            grep -qE "\] [1-9][0-9]* stream\(s\)" "$f" || { echo "::error::$f returned no streams"; exit 1; }
+          done
 
       - name: Live negative cases
         run: |

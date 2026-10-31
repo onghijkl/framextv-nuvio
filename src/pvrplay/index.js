@@ -293,6 +293,7 @@ function hedgedFetchLines(url) {
   return new Promise(function (resolve) {
     var done = false;
     var inFlight = 0;
+    var attempts = 0;
     var hedgeTimer = null;
 
     function hasSource(objs) {
@@ -302,21 +303,38 @@ function hedgedFetchLines(url) {
       return false;
     }
 
+    function finish(objs) {
+      done = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      hedgeTimer = null;
+      resolve(objs);
+    }
+
     function settle(objs) {
       inFlight--;
       if (done) return;
-      if (hasSource(objs) || inFlight === 0) {
-        done = true;
-        if (hedgeTimer) clearTimeout(hedgeTimer);
-        resolve(objs);
-      }
+      if (hasSource(objs) || inFlight === 0) finish(objs);
+    }
+
+    /**
+     * A request that errored is not an answer. Treating it as one resolved the
+     * whole hedge with [] on the first fast failure, which is exactly the case
+     * hedging exists for: cinemaos fails in milliseconds and then succeeds on
+     * an immediate retry. Retry once; the hedge timer still covers a slow call.
+     */
+    function failed() {
+      inFlight--;
+      if (done) return;
+      if (attempts < 2) return fire();
+      if (inFlight === 0) finish([]);
     }
 
     function fire() {
+      attempts++;
       inFlight++;
       timedFetch(url, null, EXTRACT_TIMEOUT_MS)
         .then(readJsonLines)
-        .then(settle, function () { settle([]); });
+        .then(settle, failed);
     }
 
     fire();
@@ -510,7 +528,17 @@ if (typeof globalThis !== "undefined") {
   globalThis.__ONGserv2 = { getStreams: getStreams };
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { getStreams: getStreams };
+  // _test exists only for tools/parse.test.js; nothing on device reads it.
+  module.exports = {
+    getStreams: getStreams,
+    _test: {
+      parseLoose: parseLoose,
+      readJsonLines: readJsonLines,
+      needsFilter: needsFilter,
+      qualityRank: qualityRank,
+      languageOf: languageOf
+    }
+  };
 } else if (typeof global !== "undefined") {
   global.getStreams = getStreams;
 } else if (typeof globalThis !== "undefined") {
