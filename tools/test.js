@@ -5,13 +5,11 @@
  *   node tools/test.js 1288069 movie                 # framextv (default)
  *   node tools/test.js 550 movie --provider=pvrplay
  *   node tools/test.js 1396 tv 1 1 --provider=pvrplay
- *   node tools/test.js 550 movie --direct
  */
 
 const path = require("path");
 
 const args = process.argv.slice(2);
-const direct = args.includes("--direct");
 const provArg = args.find((a) => a.startsWith("--provider="));
 const provider = provArg ? provArg.split("=")[1] : "framextv";
 const rest = args.filter((a) => !a.startsWith("--"));
@@ -22,9 +20,8 @@ const episode = rest[3] || 1;
 
 const mod = require(path.join(__dirname, "..", "providers", provider + ".js"));
 const { getStreams } = mod;
-getStreams.direct = direct;
 
-console.log(`[test] ${provider}.getStreams(${tmdbId}, ${mediaType}, ${season}, ${episode}) direct=${direct}`);
+console.log(`[test] ${provider}.getStreams(${tmdbId}, ${mediaType}, ${season}, ${episode})`);
 
 const started = Date.now();
 getStreams(tmdbId, mediaType, season, episode)

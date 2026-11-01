@@ -11,20 +11,17 @@
  *   - no console.* in shipped code
  *
  * Runtime notes:
- *   - The plugin QuickJS sandbox is cross-origin to framextv.xyz. Its own
- *     /api/stream service (a Cloudflare Worker) does not emit CORS headers
- *     for that origin, so a plugin cannot play the raw HLS playlist directly.
- *     This provider therefore returns frameXTV's public embed URLs, which the
- *     Nuvio player resolves. In a runtime that can reach the API without CORS
- *     (the CI test harness, for example) set direct = true to also emit the
- *     extracted HLS sources.
+ *   - The extracted HLS playlists sit behind a CDN proxy that does send
+ *     Access-Control-Allow-Origin: *, so the QuickJS sandbox can fetch them
+ *     and Nuvio's player can play them. Those direct sources are what this
+ *     provider returns; the /embed/ page is not emitted (a native player
+ *     rejects HTML with "unrecognized file format").
  *
- * Verified against the live site (Oct 2026):
- *   https://framextv.xyz/movie/<tmdbId>          details page
- *   https://framextv.xyz/tv/<tmdbId>             details page
- *   https://framextv.xyz/watch/<tmdbId>          movie playback
- *   https://framextv.xyz/watch/<tmdbId>/<s>/<e>  episode playback
- *   https://framextv.xyz/embed/<tmdbId>[/<s>/<e>]?autoplay=1&origin=internal
+ * Verified against the live site (Oct 2026), on the site's current domain:
+ *   https://framextv.cc/movie/<tmdbId>   details page
+ *   https://api.framextv.cc/api/stream   extraction
+ *   https://api.framextv.cc/api/search   title index
+ *   https://api.framextv.cc/api/subtitles
  *
  * Existence is decided by an actual extraction attempt, not by the search
  * index (which covers all of TMDB and therefore proves nothing).
@@ -182,29 +179,18 @@ function searchIndexMatch(title, year, mediaType) {
       var want = normTitle(title);
       if (!want) return null;
 
-      var exact = null;
-      var wrongYear = null;
-
+      // Exact title only. A prefix match used to be accepted as a last resort,
+      // but "Fight Club" then also matches "Fight Club Sessions" at the same
+      // year and the provider extracts streams for the wrong title. This path
+      // only runs once extraction already failed, so the cost of dropping it is
+      // a rare miss; the cost of keeping it was a wrong film.
       for (var i = 0; i < list.length; i++) {
         var item = list[i];
         if (normTitle(item.title) !== want) continue;
         if (mediaType && item.type && item.type !== mediaType) continue;
-        if (yearsClose(item.year, year)) {
-          if (!exact) exact = item;
-        } else if (!wrongYear) {
-          wrongYear = item;
-        }
-      }
-      if (exact) return exact;
-      // accept the only 1-2 year drift when the requested year was unknown
-      if (!year && wrongYear) return wrongYear;
-
-      for (var j = 0; j < list.length; j++) {
-        var g = normTitle(list[j].title);
-        if (g.indexOf(want) === 0 && yearsClose(list[j].year, year) &&
-            (!mediaType || !list[j].type || list[j].type === mediaType)) {
-          return list[j];
-        }
+        // yearsClose() reads a missing year on either side as "no evidence of a
+        // mismatch", so an unknown year takes the first exact title match.
+        if (yearsClose(item.year, year)) return item;
       }
       return null;
     })
@@ -214,24 +200,6 @@ function searchIndexMatch(title, year, mediaType) {
 }
 
 /* ------------------------------------------------------------ stream URL */
-
-function embedUrl(tmdbId, mediaType, season, episode) {
-  var base = SITE + "/embed/" + tmdbId;
-  if (mediaType === "tv") {
-    base += "/" + (season || 1) + "/" + (episode || 1);
-  }
-  return base + "?" + qs({ autoplay: 1, origin: "internal" });
-}
-
-/** Resolve a possibly-relative URL against a base. */
-function absUrl(base, rel) {
-  if (rel.indexOf("http://") === 0 || rel.indexOf("https://") === 0) return rel;
-  var m = base.match(/^(https?:\/\/[^\/]+)/);
-  var origin = m ? m[1] : "";
-  if (rel.charAt(0) === "/") return origin + rel;
-  return base.substring(0, base.lastIndexOf("/") + 1) + rel;
-}
-
 
 /**
  * Fetch the subtitle renditions frameXTV offers for a title.
@@ -277,11 +245,17 @@ function fetchSubtitles(tmdbId, mediaType, season, episode) {
  * Returns the adjusted source, or null to discard it.
  */
 /**
- * Does this master playlist contain anything the device should not be offered?
- * True when any variant is HEVC or taller than the cap.
+ * Would the playlist filter actually change anything?
+ *
+ * Only when some variants must go (HEVC, over the height or bitrate cap) AND
+ * at least one survives. These ladders are often HEVC-only; the Worker then
+ * keeps every variant anyway, so routing through it was a pointless extra hop.
  */
 function needsFilter(text) {
   var cap = getStreams.maxHeight || 1080;
+  var maxBw = getStreams.maxBitrate || 12000000;
+  var kept = 0;
+  var dropped = 0;
   var lines = text.split("\n");
   for (var i = 0; i < lines.length; i++) {
     var l = lines[i];
@@ -290,13 +264,10 @@ function needsFilter(text) {
     var h = res ? parseInt(res[2], 10) : 0;
     var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
     var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-    if (/hvc1|hev1/i.test(cod)) return true;
-    if (h && h > cap) return true;
-    // A very high bitrate buffers hard even below the height cap, so send it
-    // through the cached filter and let it be trimmed there.
-    if (bw && bw > (getStreams.maxBitrate || 12000000)) return true;
+    if (/hvc1|hev1/i.test(cod) || (h && h > cap) || (bw && bw > maxBw)) dropped++;
+    else kept++;
   }
-  return false;
+  return dropped > 0 && kept > 0;
 }
 
 /**
@@ -329,7 +300,7 @@ function prepareSource(s) {
     .then(function (r) {
       if (!r || !r.ok) return null;
       return r.text().then(function (t) {
-        if (t.indexOf("#EXTM3U") === -1) return s; // not a playlist; trust it
+        if (t.indexOf("#EXTM3U") === -1) return null; // an error page, not a playlist
 
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
         if (!isMaster && t.indexOf("#EXTINF") === -1) return null; // empty shell
@@ -338,7 +309,8 @@ function prepareSource(s) {
           return {
             url: (getStreams.filterBase || FILTER_BASE) +
               "/hls?u=" + encodeURIComponent(s.url) +
-              "&cap=" + (getStreams.maxHeight || 1080),
+              "&cap=" + (getStreams.maxHeight || 1080) +
+              "&maxbw=" + (getStreams.maxBitrate || 12000000),
             type: s.type
           };
         }
@@ -618,7 +590,6 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
     });
 }
 
-getStreams.direct = true;
 getStreams.maxHeight = 1080;
 getStreams.maxBitrate = 12000000;
 getStreams.filterBase = FILTER_BASE;
@@ -627,7 +598,16 @@ if (typeof globalThis !== "undefined") {
   globalThis.__ONGserv1 = { getStreams: getStreams };
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { getStreams: getStreams };
+  // _test exists only for tools/parse.test.js; nothing on device reads it.
+  module.exports = {
+    getStreams: getStreams,
+    _test: {
+      needsFilter: needsFilter,
+      qualityRank: qualityRank,
+      normTitle: normTitle,
+      yearsClose: yearsClose
+    }
+  };
 } else if (typeof global !== "undefined") {
   global.getStreams = getStreams;
 } else if (typeof globalThis !== "undefined") {

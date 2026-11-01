@@ -63,31 +63,21 @@ Either way, open the URL in a browser first — you should see JSON beginning
 the deployment is serving the repository as static files and the `_worker.js`
 is not being executed.
 
-### Route C — paste into the dashboard (no Git)
+### Route C — paste into the dashboard
 
-1. **Create application** → pick a simple **Worker** template → **Deploy**
-2. **Edit code** → select all, delete, paste [`worker.js`](./worker.js)
-3. **Deploy**
+Not possible any more. `worker.js` starts with `import "../providers/*.js"` so
+that one deployment can serve streams from all three providers; pasting the
+single file into the dashboard editor leaves those imports unresolved. Use
+Route A or B.
 
 ### Install in Nuvio
 
 **Settings → Addons** → paste the manifest URL above.
 
-You should get 11 new rows:
-
-| Row | Type | Items |
-|---|---|---|
-| PvrPlay Trending | movie | 14 |
-| PvrPlay Trending | series | 5 |
-| PvrPlay Movies | movie | 20 |
-| PvrPlay TV Shows | series | 20 |
-| PvrPlay Netflix | movie | 20 |
-| PvrPlay Prime Video | movie | 20 |
-| PvrPlay Disney+ | movie | 20 |
-| PvrPlay Apple TV+ | movie | 20 |
-| PvrPlay Hulu | movie | 20 |
-| PvrPlay Max | movie | 20 |
-| PvrPlay Paramount+ | movie | 4 |
+The rows come from the `CATALOGS` array in `worker.js`. Read that for the
+current list rather than a copy here, which goes stale on every edit: it
+defines the PvrPlay home-screen rows, four browse pages, and three Hindi rows
+backed by TMDB discover.
 
 ---
 
@@ -95,9 +85,10 @@ You should get 11 new rows:
 
 PvrPlay is a Next.js app. Its lists are server-rendered into the React Server
 Component payload — the `self.__next_f.push(...)` chunks embedded in the HTML.
-That payload carries **complete TMDB objects**, so there is no markup scraping
-and no API key involved: the Worker locates the item array by key name and
-reads it.
+That payload carries **complete TMDB objects**, so there is no markup scraping:
+the Worker locates the item array by key name and reads it. It still calls TMDB
+directly — for the IMDb id of each catalog item, for `/meta`, and for the Hindi
+discover rows — using the public key embedded in `worker.js`.
 
 Item ids are emitted as `tmdb:<id>`. Nuvio strips that prefix before calling
 local scrapers (`PluginContentIds.kt`), so tapping a row here resolves straight
@@ -108,8 +99,16 @@ into the **frameXTV** and **PvrPlay** stream providers in this repo.
 ```
 GET /manifest.json
 GET /catalog/<type>/<id>.json
-GET /catalog/<type>/<id>/<extra>.json     extra params ignored
+GET /catalog/<type>/<id>/<extra>.json     search= and skip= are honoured
+GET /meta/<type>/<id>.json                metadata, incl. episode lists
+GET /stream/<type>/<id>.json              streams from all three providers
+GET /hls?u=<master>&cap=1080&maxbw=...    HEVC / over-cap playlist filter
 ```
+
+`/hls` only fetches `u` when it passes `hlsTargetRefusal`: http(s) only, no
+loopback or private addresses, 2 MB ceiling. Set the `HLS_ALLOW` binding
+(comma-separated host suffixes) to turn that into a closed allowlist — without
+it the route will proxy a playlist from any public host.
 
 All responses carry `Access-Control-Allow-Origin: *` and a 10-minute cache.
 

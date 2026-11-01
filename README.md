@@ -1,7 +1,8 @@
 # frameXTV — Nuvio repository
 
 A [Nuvio](https://github.com/NuvioMedia/NuvioMobile) local-scraper provider that
-resolves movies and series to frameXTV (`https://framextv.xyz`) streams.
+resolves movies and series to frameXTV (`https://framextv.cc`) streams.
+The repository also carries two more providers and a Stremio addon Worker.
 
 Provider catalogue: [`manifest.json`](./manifest.json)
 
@@ -35,12 +36,16 @@ do not support them.
 
 ```
 framextv-nuvio/
-├── src/framextv/index.js    provider source — edit this
-├── providers/framextv.js    built output — this is what Nuvio loads
+├── src/<name>/index.js      provider source — edit this
+│                            (framextv, pvrplay, vidlink)
+├── providers/<name>.js      built output — this is what Nuvio loads
 ├── manifest.json            provider registry read by Nuvio
+├── addon/worker.js          Stremio addon + HLS playlist filter (Cloudflare)
+├── addon/_worker.js         Cloudflare Pages entry point
 ├── tools/build.js           src → providers, with validation
-├── tools/test.js            runs the built provider against live data
-└── .github/workflows/       validates the provider on every push
+├── tools/parse.test.js      offline tests for the parsers (no network)
+├── tools/test.js            runs a built provider against live data
+└── .github/workflows/       validates on every push
 ```
 
 `providers/framextv.js` is committed on purpose: Nuvio fetches it directly over
@@ -51,13 +56,15 @@ a raw URL, so the repository must always contain a ready-to-run file.
 ## Develop
 
 ```bash
+node tools/parse.test.js         # offline tests — no network, run these first
 node tools/build.js              # build + validate
-node tools/test.js 1288069 movie # test a movie
+node tools/test.js 1288069 movie # test a movie (hits the live site)
 node tools/test.js 1396 tv 1 1   # test an episode
-node tools/test.js 1396 tv 1 1 --direct   # include raw HLS extractions
+node tools/test.js 550 movie --provider=pvrplay
 ```
 
-`tools/test.js --direct` only works in Node. See *Runtime limits* below.
+`parse.test.js` is the one that fails when the code regresses; `test.js` fails
+when an upstream site moves.
 
 ---
 
@@ -70,20 +77,18 @@ node tools/test.js 1396 tv 1 1 --direct   # include raw HLS extractions
 4. A real extraction is attempted via the site's stream API. This is the
    decisive existence check — the search index covers all of TMDB and so
    proves nothing on its own.
-5. If the title is carried, `/embed/...` URLs are returned for the player.
+5. Each candidate source is fetched once to drop dead links, and a master
+   advertising HEVC or an over-cap rendition is routed through the playlist
+   filter in `addon/worker.js`.
 
 ### Runtime limits
 
-The provider runs inside Nuvio's sandboxed QuickJS engine, which is
-cross-origin to `framextv.xyz`. The site's stream API (a Cloudflare Worker)
-sends **no CORS headers**, so a plugin cannot call it directly. The provider
-therefore hands Nuvio the public **`/embed/`** URLs, and the site's own
-multi-tier extraction pipeline (Barbarian → Archer → Goblin → P.E.K.K.A) does
-the work server-side.
-
-`getStreams.direct = true` additionally returns the raw HLS playlist. That path
-is verified in Node but **cannot work on device** — it is kept for the test
-harness and for any future runtime that can reach the API without CORS.
+The provider runs inside Nuvio's sandboxed QuickJS engine. That sandbox's
+`fetch()` is not a browser fetch — there is no origin and no preflight — and
+the extracted playlists sit behind a CDN proxy that sends
+`Access-Control-Allow-Origin: *` anyway, so the provider returns those direct
+HLS sources. The `/embed/` page is **not** emitted: it is HTML, and a native
+player rejects it with "unrecognized file format".
 
 QuickJS constraints the provider respects:
 
