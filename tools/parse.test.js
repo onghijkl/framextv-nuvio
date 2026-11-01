@@ -100,6 +100,8 @@ async function main() {
     fs.unlinkSync(mjs);
   }
   const P = require(path.join(root, "providers", "pvrplay.js"))._test;
+  const F = require(path.join(root, "providers", "framextv.js"))._test;
+  const V = require(path.join(root, "providers", "vidlink.js"))._test;
 
   console.log("[parse.test] worker parsers");
 
@@ -306,6 +308,43 @@ async function main() {
       P.mediaKey(SHORT_PREFIX + encodeURIComponent(MEDIA))
     );
     assert.notStrictEqual(P.mediaKey(wrap(MEDIA)), P.mediaKey(wrap(OTHER)));
+  });
+
+  await test("extractArray finds a key that is still escaped in the payload", function () {
+    // The second needle used to be '\\"' in source, which is just '"' — a
+    // duplicate of the first search, so this form was never found and the row
+    // came back silently empty.
+    const text = '{\\"initialResults\\":[{"id":7},{"id":8}]}';
+    const items = W.extractArray(text, "initialResults");
+    assert.ok(items, "escaped key form not found");
+    assert.deepStrictEqual(items.map(function (o) { return o.id; }), [7, 8]);
+  });
+
+  await test("all three providers agree on when the filter helps", function () {
+    // These had drifted: framextv fired on the first bad variant, vidlink
+    // ignored the bitrate cap, pvrplay required a survivor. Same input, same
+    // answer, or a fix to one keeps missing the other two.
+    [
+      [MASTER_MIXED, true, "mixed ladder"],
+      [MASTER_ALL_HEVC, false, "all-HEVC ladder"],
+      [MEDIA_PLAYLIST, false, "media playlist"]
+    ].forEach(function (row) {
+      const text = row[0], want = row[1], label = row[2];
+      assert.strictEqual(P.needsFilter(text), want, "pvrplay disagrees on " + label);
+      assert.strictEqual(F.needsFilter(text), want, "framextv disagrees on " + label);
+      assert.strictEqual(V.needsFilter(text), want, "vidlink disagrees on " + label);
+    });
+  });
+
+  await test("framextv matches titles exactly, not by prefix", function () {
+    const want = F.normTitle("Fight Club");
+    assert.strictEqual(F.normTitle("Fight Club Sessions"), "fight club sessions");
+    assert.notStrictEqual(F.normTitle("Fight Club Sessions"), want);
+    assert.strictEqual(F.normTitle("Fight  Club!"), want);
+    // An unknown year on either side is not evidence of a mismatch.
+    assert.strictEqual(F.yearsClose(1999, ""), true);
+    assert.strictEqual(F.yearsClose(1999, 2005), false);
+    assert.strictEqual(F.yearsClose(1999, 2000), true);
   });
 
   console.log(

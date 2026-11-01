@@ -491,6 +491,7 @@ function gather(tmdbId, mediaType, season, episode) {
     var results = [];
     var finished = false;
     var windowTimer = null;
+    var primaryDone = false;
 
     function finish() {
       if (finished) return;
@@ -499,19 +500,30 @@ function gather(tmdbId, mediaType, season, episode) {
       resolve(results);
     }
 
-    function collect(list) {
+    /**
+     * The grace window may only start once the PRIMARY extractor has settled.
+     * cinemaos is the one that carries sources and it takes 8-11s; any
+     * extractor's sources used to start the clock, so a fallback returning one
+     * 480p source at ~800ms closed it at 2.3s and discarded cinemaos's twelve.
+     */
+    function arm() {
+      if (!primaryDone || windowTimer || !pending || !results.length) return;
+      windowTimer = setTimeout(finish, COLLECT_WINDOW_MS);
+    }
+
+    function collect(endpoint, list) {
       pending--;
-      if (list && list.length) {
-        results = results.concat(list);
-        if (!windowTimer && pending > 0) windowTimer = setTimeout(finish, COLLECT_WINDOW_MS);
-      }
-      if (pending === 0) finish();
+      if (endpoint === EXTRACTORS[0]) primaryDone = true;
+      if (list && list.length) results = results.concat(list);
+      if (pending === 0) return finish();
+      arm();
     }
 
     EXTRACTORS.forEach(function (ep) {
-      tryExtractor(ep, tmdbId, mediaType, season, episode).then(collect, function () {
-        collect(null);
-      });
+      tryExtractor(ep, tmdbId, mediaType, season, episode).then(
+        function (list) { collect(ep, list); },
+        function () { collect(ep, null); }
+      );
     });
   });
 }

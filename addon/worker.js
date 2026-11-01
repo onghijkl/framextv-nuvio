@@ -194,37 +194,16 @@ function rscPayload(html) {
 
 /** Pull one balanced JSON array out of the payload by key name. */
 function extractArray(text, key) {
-  // Some pages (the search page among them) leave the keys escaped as
-  // backslash-quote key backslash-quote colon bracket, while the values are
-  // already plain. Accept both forms.
+  // Some pages (the search page among them) leave the key escaped as
+  // \"key\":[ while the values are already plain, so both forms are tried.
+  // The second needle needs a REAL backslash: in JS source '\"' is just '"',
+  // which made the old second search a duplicate of the first and left the
+  // escaped form unhandled — the row then came back silently empty.
   let at = text.indexOf('"' + key + '":[');
-  if (at < 0) at = text.indexOf('\"' + key + '\":[', 0);
+  if (at < 0) at = text.indexOf('\\"' + key + '\\":[');
   if (at < 0) return null;
-  const start = text.indexOf("[", at);
-
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (esc) { esc = false; continue; }
-    if (c === "\\") { esc = true; continue; }
-    if (c === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (c === "[") depth++;
-    else if (c === "]") {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(start, i + 1));
-        } catch (e) {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
+  const found = balancedArray(text, text.indexOf("[", at));
+  return found ? found.arr : null;
 }
 
 /** A TMDB object is a series when it has a name (not title). */
@@ -272,6 +251,11 @@ function toMeta(o) {
  * in memory for the isolate's lifetime.
  */
 const imdbCache = new Map();
+
+// metasFor costs one TMDB subrequest per item and a Worker gets 50 per
+// request, so a site-wide search that returns 60 hits would blow the limit and
+// 500 the whole row. Browse pages are capped at 20 by the site itself.
+const SEARCH_PAGE_MAX = 40;
 
 async function imdbIdFor(tmdbId, kind) {
   const key = kind + ":" + tmdbId;
@@ -382,9 +366,12 @@ async function filterPlaylist(target, cap, maxBw) {
     return rel.charAt(0) === "/" ? origin + rel : base.slice(0, base.lastIndexOf("/") + 1) + rel;
   };
 
+  // One pass fills both: `out` keeps the survivors, `all` keeps every variant
+  // with its URI absolutised. Which one is returned is decided at the end.
   const out = [];
-  const kept = [];
-  const dropped = [];
+  const all = [];
+  let kept = 0;
+  let dropped = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -393,20 +380,22 @@ async function filterPlaylist(target, cap, maxBw) {
     // Left relative, the player would resolve them against this Worker's origin
     // instead of the upstream host, and the audio track would 404.
     if (line.indexOf("#EXT-X-MEDIA") === 0 && line.indexOf('URI="') !== -1) {
-      out.push(
-        line.replace(/URI="([^"]+)"/, (whole, uri) => 'URI="' + abs(uri) + '"')
-      );
+      const fixed = line.replace(/URI="([^"]+)"/, (whole, uri) => 'URI="' + abs(uri) + '"');
+      out.push(fixed);
+      all.push(fixed);
       continue;
     }
 
     if (line.indexOf("#EXT-X-STREAM-INF") !== 0) {
       out.push(line);
+      all.push(line);
       continue;
     }
 
     const next = (lines[i + 1] || "").trim();
     if (!next || next.charAt(0) === "#") {
       out.push(line);
+      all.push(line);
       continue;
     }
 
@@ -420,49 +409,25 @@ async function filterPlaylist(target, cap, maxBw) {
     const bandwidth = parseInt((line.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
     const tooFat = bandwidth && bandwidth > maxBw;
 
+    const uri = /^https?:\/\//i.test(next) ? next : abs(next);
+    all.push(line);
+    all.push(uri);
     if (hevc || tooTall || tooFat) {
-      dropped.push({ index: i });
-      i++; // also skip the URI line
-      continue;
+      dropped++;
+    } else {
+      kept++;
+      out.push(line);
+      out.push(uri);
     }
-
-    kept.push({ index: i });
-    out.push(line);
-    out.push(/^https?:\/\//i.test(next) ? next : abs(next));
-    i++;
+    i++; // the URI line is consumed either way
   }
 
   // Nothing worth removing: return the original untouched.
-  if (!dropped.length) return text;
+  if (!dropped) return text;
 
-  // If the cap removes everything, keep the best of what was dropped rather
-  // than returning a playlist the player cannot use. Rebuild from scratch in
-  // that case, since the pass above already emitted the survivors.
-  if (!kept.length) {
-    const rebuilt = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.indexOf("#EXT-X-MEDIA") === 0 && line.indexOf('URI="') !== -1) {
-        rebuilt.push(line.replace(/URI="([^"]+)"/, (w, uri) => 'URI="' + abs(uri) + '"'));
-        continue;
-      }
-      if (line.indexOf("#EXT-X-STREAM-INF") !== 0) {
-        rebuilt.push(line);
-        continue;
-      }
-      const next = (lines[i + 1] || "").trim();
-      if (!next || next.charAt(0) === "#") {
-        rebuilt.push(line);
-        continue;
-      }
-      rebuilt.push(line);
-      rebuilt.push(/^https?:\/\//i.test(next) ? next : abs(next));
-      i++;
-    }
-    return rebuilt.join("\n");
-  }
-
-  return out.join("\n");
+  // When the cap removed every variant, hand back all of them rather than a
+  // playlist the player cannot use.
+  return (kept ? out : all).join("\n");
 }
 
 /**
@@ -616,7 +581,6 @@ async function meta(type, rawId) {
     country: (d.origin_country || []).join(", ") || undefined,
     language: d.original_language || undefined,
     website: d.homepage || undefined,
-    awards: d.awards || undefined,
     network: (d.networks || []).map(function (n) { return n.name; }).join(", ") || undefined,
     genres: (d.genres || []).map(function (g) {
       return g.name;
@@ -773,7 +737,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.6.2",
+    version: "1.6.3",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -849,7 +813,7 @@ function parseHomeRows(payload) {
  * Search PvrPlay directly. The site's own search returns complete TMDB objects
  * under `initialResults`, so results match what the site would show.
  */
-async function searchPvrPlay(query, type) {
+async function searchPvrPlay(query, type, extra) {
   const r = await fetch(PVR_BASE + "/search?q=" + encodeURIComponent(query), {
     headers: { "User-Agent": UA, Accept: "text/html" },
     cf: { cacheTtl: 600, cacheEverything: true }
@@ -859,7 +823,10 @@ async function searchPvrPlay(query, type) {
   const items = extractArray(rscPayload(await r.text()), "initialResults");
   if (!items) return { metas: [] };
 
-  return { metas: await metasFor(items, type) };
+  // Skip and cap BEFORE the lookups, not after: the items thrown away here
+  // would otherwise each cost a TMDB round trip first.
+  const page = applySkip(items, extra).slice(0, SEARCH_PAGE_MAX);
+  return { metas: await metasFor(page, type) };
 }
 
 /**
@@ -867,12 +834,15 @@ async function searchPvrPlay(query, type) {
  *
  * Without it, scrolling re-fetches the same first page, so a long row can
  * never be scrolled past its first items.
+ *
+ * Applied to the raw items, before metasFor: each item costs a TMDB subrequest
+ * there, and skipping afterwards paid for every one of them only to discard it.
  */
-function applySkip(metas, extra) {
-  if (!extra) return metas;
+function applySkip(items, extra) {
+  if (!extra) return items;
   const skip = parseInt(extra.skip, 10);
-  if (!isFinite(skip) || skip <= 0) return metas;
-  return metas.slice(skip);
+  if (!isFinite(skip) || skip <= 0) return items;
+  return items.slice(skip);
 }
 
 async function catalog(type, id, extra) {
@@ -885,8 +855,7 @@ async function catalog(type, id, extra) {
   // The site's search covers the whole catalogue, so every row can be
   // searchable rather than just the two that happen to list films.
   if (extra && extra.search) {
-    const found = await searchPvrPlay(extra.search, type);
-    return { metas: applySkip(found.metas, extra) };
+    return await searchPvrPlay(extra.search, type, extra);
   }
 
   // Rows lifted from the PvrPlay home screen.
@@ -902,7 +871,7 @@ async function catalog(type, id, extra) {
     });
     if (!row) return { metas: [] };
 
-    return { metas: applySkip(await metasFor(row.items, type), extra) };
+    return { metas: await metasFor(applySkip(row.items, extra), type) };
   }
 
   // TMDB-backed rows (the Hindi ones).
@@ -952,7 +921,7 @@ async function catalog(type, id, extra) {
   // These pages are a single server-rendered list (?page= is ignored), so a
   // scroll request past it must return nothing — returning the same list
   // again made clients append the row to itself forever.
-  return { metas: applySkip(await metasFor(normalised, type), extra) };
+  return { metas: await metasFor(applySkip(normalised, extra), type) };
 }
 
 /**

@@ -104,9 +104,18 @@ function absUrl(base, rel) {
 
 /* ------------------------------------------------------- validation/filter */
 
-/** Does this master carry HEVC or a rendition above the cap? */
+/**
+ * Would the playlist filter actually change anything?
+ *
+ * Only when some variants must go (HEVC, over the height or bitrate cap) AND
+ * at least one survives. These ladders are often HEVC-only; the Worker then
+ * keeps every variant anyway, so routing through it was a pointless extra hop.
+ */
 function needsFilter(text) {
   var cap = getStreams.maxHeight || 1080;
+  var maxBw = getStreams.maxBitrate || 12000000;
+  var kept = 0;
+  var dropped = 0;
   var lines = text.split("\n");
   for (var i = 0; i < lines.length; i++) {
     var l = lines[i];
@@ -114,15 +123,16 @@ function needsFilter(text) {
     var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
     var h = res ? parseInt(res[2], 10) : 0;
     var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
-    if (/hvc1|hev1/i.test(cod)) return true;
-    if (h && h > cap) return true;
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+    if (/hvc1|hev1/i.test(cod) || (h && h > cap) || (bw && bw > maxBw)) dropped++;
+    else kept++;
   }
-  return false;
+  return dropped > 0 && kept > 0;
 }
 
 function prepareSource(s) {
   var isHls =
-    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("playlist") !== -1;
+    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url);
 
   if (!isHls) return Promise.resolve(s);
 
@@ -130,7 +140,7 @@ function prepareSource(s) {
     .then(function (r) {
       if (!r || !r.ok) return null;
       return r.text().then(function (t) {
-        if (t.indexOf("#EXTM3U") === -1) return s;
+        if (t.indexOf("#EXTM3U") === -1) return null; // an error page, not a playlist
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
         if (!isMaster && t.indexOf("#EXTINF") === -1) return null;
 
@@ -138,7 +148,8 @@ function prepareSource(s) {
           return {
             url: (getStreams.filterBase || FILTER_BASE) +
               "/hls?u=" + encodeURIComponent(s.url) +
-              "&cap=" + (getStreams.maxHeight || 1080),
+              "&cap=" + (getStreams.maxHeight || 1080) +
+              "&maxbw=" + (getStreams.maxBitrate || 12000000),
             quality: s.quality,
             subtitles: s.subtitles
           };
@@ -313,13 +324,22 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 }
 
 getStreams.maxHeight = 1080;
+getStreams.maxBitrate = 12000000;
 getStreams.filterBase = FILTER_BASE;
 
 if (typeof globalThis !== "undefined") {
   globalThis.__ONGserv3 = { getStreams: getStreams };
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { getStreams: getStreams };
+  // _test exists only for tools/parse.test.js; nothing on device reads it.
+  module.exports = {
+    getStreams: getStreams,
+    _test: {
+      needsFilter: needsFilter,
+      qualityRank: qualityRank,
+      labelFor: labelFor
+    }
+  };
 } else if (typeof global !== "undefined") {
   global.getStreams = getStreams;
 } else if (typeof globalThis !== "undefined") {
