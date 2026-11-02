@@ -392,6 +392,37 @@ function normaliseSource(s) {
 }
 
 /**
+ * One entry per (audio track, resolution).
+ *
+ * cinemaos restates the same source twice per resolution: the MovieBox HLS
+ * re-wrap (an adaptive master, so its "quality" is only its top variant) and
+ * the direct CDN file. Both play the same audio track at the same resolution,
+ * so listing them side by side reads as "several links for one quality". Keep a
+ * single entry and prefer the direct file — no converter hop in front of it. An
+ * HLS entry survives only where it is the sole option for that resolution.
+ *
+ * Entries must carry _lang, _ql and _hls (set in getStreams) and the list must
+ * already be sorted best-first, so "first wins" means "best wins".
+ */
+function collapseTrackQuality(list) {
+  var best = {};
+  var i, key;
+  for (i = 0; i < list.length; i++) {
+    key = list[i]._lang + "|" + list[i]._ql;
+    if (!best[key] || (best[key]._hls && !list[i]._hls)) best[key] = list[i];
+  }
+  var seen = {};
+  var kept = [];
+  for (i = 0; i < list.length; i++) {
+    key = list[i]._lang + "|" + list[i]._ql;
+    if (seen[key] || best[key] !== list[i]) continue;
+    seen[key] = true;
+    kept.push(list[i]);
+  }
+  return kept;
+}
+
+/**
  * Hedged request for the primary extractor.
  *
  * cinemaos's response time is wildly uneven for the same title (measured
@@ -604,6 +635,8 @@ function extract(tmdbId, mediaType, season, episode) {
           _hls: fmt === "HLS" ? 1 : 0,
           _v: s.verified ? 1 : 0,
           _lat: s.latencyMs == null ? 99999 : s.latencyMs,
+          _lang: lang,
+          _ql: s.quality || "Auto",
           name: "ongserv2",
           title: "ongserv2 \u2022 " + (s.quality || "Auto") +
             (lang ? " \u2022 " + lang : "") +
@@ -621,11 +654,15 @@ function extract(tmdbId, mediaType, season, episode) {
         return (a._lr - b._lr) || (b._q - a._q) || (b._v - a._v) ||
           (b._hls - a._hls) || (a._lat - b._lat);
       });
+      // cinemaos restates the same source twice for one resolution (MovieBox HLS
+      // re-wrap + direct CDN file) — collapse each (language, resolution) pair.
+      out = collapseTrackQuality(out);
       var max = getStreams.maxResults || 0;
       if (max > 0 && out.length > max) out = out.slice(0, max);
       for (var c = 0; c < out.length; c++) {
         delete out[c]._lr; delete out[c]._q; delete out[c]._hls;
-        delete out[c]._v; delete out[c]._lat;
+        delete out[c]._v; delete out[c]._lat; delete out[c]._lang;
+        delete out[c]._ql;
       }
       return out;
     });
@@ -669,7 +706,8 @@ if (typeof module !== "undefined" && module.exports) {
       qualityRank: qualityRank,
       languageOf: languageOf,
       unwrapProxy: unwrapProxy,
-      mediaKey: mediaKey
+      mediaKey: mediaKey,
+      collapseTrackQuality: collapseTrackQuality
     }
   };
 } else if (typeof global !== "undefined") {

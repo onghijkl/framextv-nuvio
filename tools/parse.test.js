@@ -347,6 +347,36 @@ async function main() {
     assert.strictEqual(F.yearsClose(1999, 2000), true);
   });
 
+  await test("one link per audio track and resolution", function () {
+    // Same source twice: a MovieBox HLS re-wrap and the direct CDN file.
+    const rows = [
+      { _lang: "English", _ql: "480p", _hls: 1, url: "hls-480" },
+      { _lang: "English", _ql: "480p", _hls: 0, url: "mp4-480" },
+      { _lang: "English", _ql: "720p", _hls: 0, url: "mp4-720" },
+      { _lang: "Hindi", _ql: "1080p", _hls: 1, url: "hls-1080" }
+    ];
+    const out = P.collapseTrackQuality(rows);
+    assert.deepStrictEqual(out.map(function (r) { return r.url; }),
+      ["mp4-480", "mp4-720", "hls-1080"]);
+  });
+
+  await test("collapsing keeps the direct file over the HLS re-wrap", function () {
+    const rows = [
+      { _lang: "English", _ql: "1080p", _hls: 1, url: "hls" },
+      { _lang: "English", _ql: "1080p", _hls: 0, url: "mp4" }
+    ];
+    assert.deepStrictEqual(P.collapseTrackQuality(rows).map(function (r) { return r.url; }), ["mp4"]);
+  });
+
+  await test("collapsing keeps files of different qualities", function () {
+    const rows = [
+      { _lang: "English", _ql: "480p", _hls: 1, url: "a" },
+      { _lang: "English", _ql: "720p", _hls: 0, url: "b" },
+      { _lang: "Hindi", _ql: "480p", _hls: 0, url: "c" }
+    ];
+    assert.strictEqual(P.collapseTrackQuality(rows).length, 3);
+  });
+
   console.log(
     "\n[parse.test] " + passed + " passed" +
       (process.exitCode ? ", FAILURES above" : "")
