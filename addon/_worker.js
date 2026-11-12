@@ -35,6 +35,8 @@ export default {
       path === "/" ||
       path === "/manifest.json" ||
       path === "/hls" ||
+      path === "/desi" ||
+      path.startsWith("/desi/") ||
       /^\/meta\/[^/]+\/.+\.json$/.test(path) ||
       /^\/catalog\/[^/]+\/[^/]+?(?:\/[^/]*)?\.json$/.test(path) ||
       /^\/stream\/[^/]+\/.+\.json$/.test(path);
