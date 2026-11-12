@@ -198,3 +198,26 @@ player follows the redirect). The ad-gate chain is skipped entirely by calling
 
 Tests: `node --test tools/desitashan.test.js` (fixtures in
 `tools/fixtures-dts/`).
+
+## Desi Serials (series-only addon, mounted at `/dss`)
+
+A third install point served by the *same* `addon/desitashan.js` module: a
+series-first manifest so the serial library can be added as its own addon
+without the channel/RSS rows of `/dts`.
+
+* Manifest: `https://<worker-host>/dss/manifest.json`
+  (addon id `org.pvrplay.desitashan.series`, independently versioned)
+* Catalogs:
+  * `dss:by-channel` (type `series`) — **every show hub exactly once, sorted by
+    channel name and then show name**; each card carries the channel as its
+    `releaseInfo` badge and "`<Channel>` · `<Show>` full episodes" as subtitle.
+    Paginated 20 per page (`?skip=`).
+  * `dss:updates` (type `movie`) — **newest episodes across all channels,
+    newest first** (title dates parsed for ordering/display, channel shown in
+    the subtitle).
+  * `dss:search` — `?search=<query>` over the show list.
+* Ids are the same `dts:show:<channel>~<slug>` / `dts:ep:<slug>_<pid>` used by
+  `/dts`, so meta/stream work from either manifest, and `/dts/p?e=…` playback
+  relay is shared.
+* Both addons can be installed side by side (different manifest ids), or just
+  `/dss` on its own.

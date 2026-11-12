@@ -39,6 +39,8 @@ export default {
       path.startsWith("/desi/") ||
       path === "/dts" ||
       path.startsWith("/dts/") ||
+      path === "/dss" ||
+      path.startsWith("/dss/") ||
       /^\/meta\/[^/]+\/.+\.json$/.test(path) ||
       /^\/catalog\/[^/]+\/[^/]+?(?:\/[^/]*)?\.json$/.test(path) ||
       /^\/stream\/[^/]+\/.+\.json$/.test(path);

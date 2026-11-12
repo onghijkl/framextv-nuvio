@@ -4,7 +4,7 @@ import "../providers/framextv.js";
 import "../providers/pvrplay.js";
 import "../providers/vidlink.js";
 import { handleDesi } from "./desi.js";
-import { handleDesiTashan } from "./desitashan.js";
+import { handleDesiTashan, handleDesiSeries } from "./desitashan.js";
 
 /**
  * PvrPlay Catalogs — a Stremio-protocol addon for Nuvio
@@ -739,7 +739,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.6.5",
+    version: "1.6.6",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -1026,6 +1026,11 @@ export default {
       // Desi Tashan — second self-contained catalog addon, mounted under /dts.
       if (path === "/dts" || path.startsWith("/dts/")) {
         return handleDesiTashan(request, url, `${url.protocol}//${url.host}`);
+      }
+
+      // Desi Serials — series-only view of Desi Tashan, mounted under /dss.
+      if (path === "/dss" || path.startsWith("/dss/")) {
+        return handleDesiSeries(request, url, `${url.protocol}//${url.host}`);
       }
 
       if (path === "/" || path === "/manifest.json") {

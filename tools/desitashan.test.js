@@ -65,3 +65,42 @@ test("channel list is deduplicated", () => {
   assert.equal(new Set(slugs).size, slugs.length);
   assert.ok(slugs.includes("star-plus"));
 });
+
+test("series manifest exposes channel + updates rows", () => {
+  const m = _test.dssManifest("https://example.test");
+  assert.equal(m.id, "org.pvrplay.desitashan.series");
+  assert.match(m.version, /^\d+\.\d+\.\d+$/);
+  assert.deepEqual(m.resources, ["catalog", "meta", "stream"]);
+  assert.ok(m.types.includes("series"));
+  const ids = m.catalogs.map((c) => c.id);
+  assert.deepEqual(ids, ["dss:by-channel", "dss:updates", "dss:search"]);
+  assert.equal(m.catalogs[0].type, "series");
+  assert.equal(m.catalogs[1].type, "movie");
+  assert.notEqual(m.id, _test.dtsManifest("https://example.test").id);
+});
+
+test("channel labels and title parsing", () => {
+  assert.equal(_test.channelLabel("star-plus"), "Star Plus");
+  assert.equal(_test.channelLabel(""), "Other");
+  assert.equal(_test.channelLabel("some-new-channel"), "Some New Channel");
+  assert.equal(_test.titleChannel("Anupama 12th November 2026 Full Episode | Star Plus"), "Star Plus");
+  assert.equal(_test.titleChannel("No channel here"), "");
+  const d = _test.titleDate("Anupama 12th November 2026 Full Episode | Star Plus");
+  assert.equal(new Date(d).toISOString().slice(0, 10), "2026-11-12");
+  assert.equal(_test.titleDate("no date"), 0);
+});
+
+test("channel-qualified show ids are routable", async () => {
+  const pid = "2df34ae6ad969547";
+  assert.equal(_test.showId("anupama", "star-plus"), "dts:show:star-plus~anupama");
+  assert.equal(_test.showId("anupama", ""), "dts:show:anupama");
+  // explicit episode id inside a channel-qualified show id needs no network
+  assert.equal(
+    await _test.pathForStreamId(`dts:show:star-plus~anupama:${pid}`),
+    `/anupama/${pid}/`
+  );
+  // the flat form still works the same way
+  assert.equal(await _test.pathForStreamId(`dts:show:anupama:${pid}`), `/anupama/${pid}/`);
+  // unresolvable selection returns a string, never throws
+  assert.equal(typeof (await _test.pathForStreamId("dts:show:star-plus~anupama:zzz")), "string");
+});

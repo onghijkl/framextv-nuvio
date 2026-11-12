@@ -33,7 +33,10 @@ const SITE_REF = "https://www.desitashan.su/";
 const FREEZOD_PLAY = "https://freezod.com/hls-synapsixto/";
 const FREEZOD_META = "https://freezod.com/hls-synapsixto/media_meta.php";
 
-const ADDON_VERSION = "1.0.0";
+const ADDON_VERSION = "1.1.0";
+// The series-only add-on (/dss) is versioned independently from the add-on
+// that carries channels + search (/dts).
+const SERIES_VERSION = "1.0.0";
 
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 " +
@@ -584,16 +587,19 @@ async function pathForStreamId(id) {
   let m = raw.match(/dts:ep:(.+)_([a-f0-9]{16})$/);
   if (m) return episodePath(m[1], m[2]);
 
-  // dts:show:<slug>[:<season>:<episode>]
-  m = raw.match(/dts:show:([a-z0-9][a-z0-9-]*)(?::(.*))?$/);
+  // dts:show:<channel>~<slug>[:<season>:<episode>]  (channel part optional)
+  m = raw.match(/dts:show:([a-z0-9][a-z0-9-]*(?:~[a-z0-9][a-z0-9-]*)?)(?::(.*))?$/);
   if (m) {
-    const slug = m[1];
+    const parts = m[1].split("~");
+    const slug = parts.length > 1 ? parts[1] : parts[0];
+    let channel = parts.length > 1 ? parts[0] : "";
     const sel = (m[2] || "").split(":").filter(Boolean);
     const pid = sel.find((s) => HEX_ID.test(s));
-    if (pid) return episodePath(pid && slug, pid);
+    if (pid) return episodePath(slug, pid);
 
-    const hubHtml = await fetchText(SITE + "/category/" + slug + "/", 6 * 60 * 60 * 1000, SITE_REF);
-    const channel = parseShowHub(hubHtml).channel;
+    const base = channel ? "/category/" + channel + "/" + slug + "/" : "/category/" + slug + "/";
+    const hubHtml = await fetchText(SITE + base, 6 * 60 * 60 * 1000, SITE_REF);
+    channel = channel || parseShowHub(hubHtml).channel;
     const listUrl = channel
       ? SITE + "/category/" + channel + "/" + slug + "/"
       : SITE + "/category/" + slug + "/";
@@ -617,6 +623,153 @@ async function pathForStreamId(id) {
 }
 
 /* ----------------------------------------------------------------- router */
+
+/* --------------------------------------------- series-only add-on (/dss)
+ * A second manifest so the serial library can be installed as its own add-on:
+ *   <origin>/dss/manifest.json
+ * Its rows are ordered by channel name ("Serials — By Channel") and by
+ * publish time, newest first ("Serials — New Updates"). Meta/stream reuse the
+ * /dts implementation, so ids stay interchangeable between both add-ons.
+ */
+
+const SERIES_MONTHS = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+/** "12th November 2026" -> UTC ms (0 when the title has no date). */
+function titleDate(title) {
+  const m = String(title || "").match(/(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?\s*(\d{4})/i);
+  if (!m) return 0;
+  const mon = SERIES_MONTHS[m[2].slice(0, 3).toLowerCase()];
+  if (mon === undefined) return 0;
+  return Date.UTC(Number(m[3]), mon, Number(m[1]));
+}
+
+/** "… Full Episode | Zee TV" -> "Zee TV" */
+function titleChannel(title) {
+  const parts = String(title || "").split("|");
+  return parts.length > 1 ? text(parts[parts.length - 1]) : "";
+}
+
+function channelLabel(slug) {
+  return slug ? CHANNEL_NAMES[slug] || prettify(slug) : "Other";
+}
+
+/**
+ * Every show hub exactly once, tagged with its channel, sorted by channel
+ * name and then show name. Channel-qualified sitemap keys win over flat ones,
+ * because they already carry the hub path.
+ */
+async function seriesShowKeys() {
+  const xml = (await fetchText(SITE + "/category-sitemap.xml", 6 * 60 * 60 * 1000, SITE_REF)) || "";
+  const bySlug = new Map();
+  for (const key of parseCategorySitemap(xml)) {
+    const hasChannel = key.includes("~");
+    const channel = hasChannel ? key.split("~")[0] : "";
+    const slug = hasChannel ? key.split("~")[1] : key;
+    const prev = bySlug.get(slug);
+    if (!prev || (!prev.channel && channel)) bySlug.set(slug, { slug, channel });
+  }
+  return [...bySlug.values()].sort((a, b) => {
+    const ca = channelLabel(a.channel).toLowerCase();
+    const cb = channelLabel(b.channel).toLowerCase();
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    const sa = prettify(a.slug).toLowerCase();
+    const sb = prettify(b.slug).toLowerCase();
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  });
+}
+
+/** Row 1 — shows ordered by channel name, then show name. */
+async function showsByChannelCatalog(skip) {
+  const keys = await seriesShowKeys();
+  const page = keys.slice(skip, skip + PAGE_SIZE);
+  return Promise.all(
+    page.map(async ({ slug, channel }) => {
+      const hubUrl = SITE + "/category/" + (channel ? channel + "/" : "") + slug + "/";
+      const hubHtml = await fetchText(hubUrl, 6 * 60 * 60 * 1000, SITE_REF);
+      const hub = hubHtml ? parseShowHub(hubHtml) : { name: "", poster: "", channel: "" };
+      const label = channelLabel(channel || hub.channel);
+      const name = hub.name || prettify(slug);
+      return {
+        id: showId(slug, channel || hub.channel),
+        type: "series",
+        name,
+        poster: hub.poster || FALLBACK_POSTER,
+        posterShape: "landscape",
+        description: label + " · " + name + " full episodes",
+        releaseInfo: label,
+      };
+    })
+  );
+}
+
+/** Row 2 — newest episodes across every channel, newest first. */
+async function updatesCatalog(skip) {
+  const metas = await latestCatalog(skip);
+  return metas
+    .map((m) => ({ ...m, _t: titleDate(m.name) }))
+    .sort((a, b) => (b._t || 0) - (a._t || 0))
+    .map((m) => {
+      const channel = titleChannel(m.name);
+      const out = {
+        ...m,
+        name: cleanEpisodeTitle(m.name),
+        releaseInfo: channel || m.releaseInfo,
+      };
+      delete out._t;
+      if (channel) out.description = channel + " · New episode";
+      return out;
+    });
+}
+
+/** "Anupama 12th November 2026 Full Episode | Star Plus" -> "Anupama 12 November 2026" */
+function cleanEpisodeTitle(title) {
+  return String(title || "")
+    .split("|")[0]
+    .replace(/\s+(full\s+)?episode\b/i, "")
+    .replace(/(\d{1,2})(st|nd|rd|th)\s+/i, "$1 ")
+    .trim();
+}
+
+export function dssManifest(origin) {
+  return {
+    id: "org.pvrplay.desitashan.series",
+    version: SERIES_VERSION,
+    name: "Desi Serials",
+    description:
+      "Desi TV serial library from desitashan.su — every show sorted by channel, plus a newest-first episode feed.",
+    resources: ["catalog", "meta", "stream"],
+    types: ["series", "movie"],
+    idPrefixes: ["dts:"],
+    catalogs: [
+      {
+        type: "series",
+        id: "dss:by-channel",
+        name: "Serials · By Channel",
+        extra: [{ name: "skip", isRequired: false }],
+      },
+      {
+        type: "movie",
+        id: "dss:updates",
+        name: "Serials · New Updates",
+        extra: [{ name: "skip", isRequired: false }],
+      },
+      {
+        type: "series",
+        id: "dss:search",
+        name: "Serials · Search",
+        extra: [
+          { name: "search", isRequired: true },
+          { name: "skip", isRequired: false },
+        ],
+      },
+    ],
+    behaviorHints: { configurable: false },
+  };
+}
+
 
 export function dtsManifest(origin) {
   const catalogs = [
@@ -657,13 +810,17 @@ export function dtsManifest(origin) {
   };
 }
 
-async function handleCatalog(type, id, url) {
+async function handleCatalog(type, id, url, variant = "dts") {
   const skip = Math.max(0, Number(url.searchParams.get("skip")) || 0);
   const search = (url.searchParams.get("search") || "").trim();
   let metas = [];
 
   try {
-    if (id === "dts:latest") metas = await latestCatalog(skip);
+    if (variant === "dss") {
+      if (id === "dss:by-channel") metas = await showsByChannelCatalog(skip);
+      else if (id === "dss:updates") metas = await updatesCatalog(skip);
+      else if (id.startsWith("dss:search")) metas = await searchCatalog(search, skip);
+    } else if (id === "dts:latest") metas = await latestCatalog(skip);
     else if (id.startsWith("dts:ch:")) metas = await channelCatalog(id.slice(7), skip);
     else if (id === "dts:shows") metas = await showsCatalog(skip);
     else if (id.startsWith("dts:search")) metas = await searchCatalog(search, skip);
@@ -677,7 +834,8 @@ async function handleCatalog(type, id, url) {
     if (e) memSet("pid:" + e[2], e[1], 6 * 60 * 60 * 1000);
   }
 
-  return json({ metas }, id.startsWith("dts:search") ? 60 : 600);
+  const noCache = id.includes("search");
+  return json({ metas }, noCache ? 60 : 600);
 }
 
 async function handleMeta(type, id) {
@@ -745,22 +903,31 @@ async function handleRelay(url) {
  * Router for /dts/*. Returns a Response, or null when the path is not ours.
  */
 export async function handleDesiTashan(request, url, origin) {
-  const path = url.pathname;
-  if (path !== "/dts" && !path.startsWith("/dts/")) return null;
+  return routeAddon(url, origin, "/dts", "dts");
+}
 
-  if (path === "/dts" || path === "/dts/" || path === "/dts/manifest.json") {
-    return json(dtsManifest(origin), 600);
+/** Series-only add-on: same module, separate manifest + catalogs at /dss. */
+export async function handleDesiSeries(request, url, origin) {
+  return routeAddon(url, origin, "/dss", "dss");
+}
+
+async function routeAddon(url, origin, mount, variant) {
+  const path = url.pathname;
+  if (path !== mount && !path.startsWith(mount + "/")) return null;
+
+  if (path === mount || path === mount + "/" || path === mount + "/manifest.json") {
+    return json(variant === "dss" ? dssManifest(origin) : dtsManifest(origin), 600);
   }
-  if (path === "/dts/p") return handleRelay(url);
+  if (path === mount + "/p") return handleRelay(url);
 
   let m;
-  if ((m = path.match(/^\/dts\/catalog\/([^/]+)\/(.+)\.json$/))) {
-    return handleCatalog(m[1], decodeURIComponent(m[2]), url);
+  if ((m = path.match(new RegExp("^" + mount + "/catalog/([^/]+)/(.+)\\.json$")))) {
+    return handleCatalog(m[1], decodeURIComponent(m[2]), url, variant);
   }
-  if ((m = path.match(/^\/dts\/meta\/([^/]+)\/(.+)\.json$/))) {
+  if ((m = path.match(new RegExp("^" + mount + "/meta/([^/]+)/(.+)\\.json$")))) {
     return handleMeta(m[1], decodeURIComponent(m[2]));
   }
-  if ((m = path.match(/^\/dts\/stream\/([^/]+)\/(.+)\.json$/))) {
+  if ((m = path.match(new RegExp("^" + mount + "/stream/([^/]+)/(.+)\\.json$")))) {
     return handleStream(m[1], decodeURIComponent(m[2]), origin);
   }
   return json({ err: "not found" }, 60, 404);
@@ -780,6 +947,10 @@ export const _test = {
   episodeId,
   showId,
   dtsManifest,
+  dssManifest,
+  channelLabel,
+  titleDate,
+  titleChannel,
   pathForStreamId,
   CHANNELS,
 };
