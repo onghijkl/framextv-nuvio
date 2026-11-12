@@ -49,7 +49,7 @@ const CHANNELS = [
   { slug: "sony-tv", name: "Sony TV" },
   { slug: "sab-tv", name: "SAB TV" },
   { slug: "colors-tv", name: "Colors TV" },
-  { slug: "and-tv", name: "& TV" },
+  { slug: "and-tv", name: "&TV" },
   { slug: "star-bharat", name: "Star Bharat" },
   { slug: "dangal-tv", name: "Dangal TV" },
   { slug: "mtv", name: "MTV" },
