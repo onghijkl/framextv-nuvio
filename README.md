@@ -163,3 +163,38 @@ the worker with the right headers, while media segments are rewritten to the CDN
 as absolute URLs and stream directly (segments need no headers at all).
 
 Tests: `node --test tools/desi.test.js` (fixtures in `tools/fixtures-desi/`).
+
+---
+
+## Desi Tashan (second catalog addon, mounted at `/dts`)
+
+`addon/desitashan.js` is another self-contained catalog addon, mounted under the
+`/dts` prefix. It turns **desitashan.su** into a browsable catalogue of Desi
+serial episodes (Anupama, Vasudha, Pushpa Impossible, Dilon Ki Ram Leela, …).
+
+* Manifest: `https://<worker-host>/dts/manifest.json`
+* Catalogs: `dts:latest` (RSS feed, newest first), one per channel
+  (`dts:ch:<slug>` — `star-plus`, `zee-tv`, `sony-tv`, `sab-tv`, `colors-tv`,
+  `and-tv`, `star-bharat`, `dangal-tv`, `mtv`, `sun-neo`), `dts:shows`
+  (series-type, browsable channel → show hub → episodes) and `dts:search`.
+* Ids: series `dts:show:<show-slug>`, episode
+  `dts:ep:<episode-slug>_<16-hex-publicId>`.
+* Episodes are numbered `season = year`, `episode = day-of-year` from the date
+  in the title, matching the `/desi` addon.
+
+### How playback works
+
+1. Episode page carries a `getlink.php?v=<token>` link (all 5 "player servers"
+   share the same token).
+2. `freezod.com/hls-synapsixto/media_meta.php?v=<token>&type=player` → JSON with
+   a signed `play.php?v=…&exp=…&sig=…` URL, poster and title. No Referer needed.
+3. `play.php` → `302` to a signed Yandex Disk CDN MP4 that supports `Range`.
+
+Both the `play.php` token (`exp`, ~60 min) and the CDN URL are short-lived, so
+nothing is cached: `/dts/p?e=<episodePath>` re-resolves the chain on every play
+and `302`s to the fresh CDN URL (Range requests pass straight through, since the
+player follows the redirect). The ad-gate chain is skipped entirely by calling
+`media_meta.php` directly.
+
+Tests: `node --test tools/desitashan.test.js` (fixtures in
+`tools/fixtures-dts/`).

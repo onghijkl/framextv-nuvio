@@ -31,6 +31,11 @@ jobs:
       - name: Parser tests
         run: node tools/parse.test.js
 
+      # Offline tests for the self-contained catalog addons mounted under
+      # /desi and /dts (fixtures are committed, no network needed).
+      - name: Catalog addon tests
+        run: node --test tools/desi.test.js tools/desitashan.test.js
+
       - name: Manifest sanity
         run: |
           node -e '
