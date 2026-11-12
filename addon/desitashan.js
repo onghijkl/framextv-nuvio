@@ -33,7 +33,7 @@ const SITE_REF = "https://www.desitashan.su/";
 const FREEZOD_PLAY = "https://freezod.com/hls-synapsixto/";
 const FREEZOD_META = "https://freezod.com/hls-synapsixto/media_meta.php";
 
-const ADDON_VERSION = "1.1.0";
+const ADDON_VERSION = "1.1.1";
 // The series-only add-on (/dss) is versioned independently from the add-on
 // that carries channels + search (/dts).
 const SERIES_VERSION = "1.0.0";
@@ -286,13 +286,18 @@ function parseCategorySitemap(xml) {
 }
 
 /** Show hub page -> {name, poster, channel} */
-function parseShowHub(html) {
+function parseShowHub(html, slug) {
   const h = String(html || "");
   const og = h.match(/property="og:image"[^>]*content="([^"]+)"/);
   const img = h.match(/<img[^>]+src="(\/media-cache\/[^"]+)"/);
   const title = h.match(/<title>([^<]*)<\/title>/);
   const h1 = h.match(/<h1[^>]*>([\s\S]*?)<\/h1>/);
-  const channel = h.match(/href="\/category\/([a-z0-9][a-z0-9-]*)\/"/);
+  // Site nav always links /category/<ch>/ first, so when we know the show slug
+  // only accept a channel that actually hosts *this* show.
+  let channel = slug
+    ? h.match(new RegExp('href="/category/([a-z0-9][a-z0-9-]*)/' + slug + '/"'))
+    : null;
+  if (!channel) channel = h.match(/href="\/category\/([a-z0-9][a-z0-9-]*)\/"/);
   let name = text(h1 ? h1[1] : title ? title[1] : "");
   name = name
     .replace(/^(latest|watch|all)\s+/i, "")
@@ -445,11 +450,11 @@ async function showMeta(id) {
     const url = SITE + "/category/" + (ch ? ch + "/" : "") + slug + "/";
     const html = await fetchText(url, 6 * 60 * 60 * 1000, SITE_REF);
     if (!html) continue;
-    const parsed = parseShowHub(html);
+    const parsed = parseShowHub(html, slug);
     if (!hub.poster && parsed.poster) {
       hubHtml = html;
       hub = parsed;
-      channel = parseShowHub(html).channel || ch || "";
+      channel = parseShowHub(html, slug).channel || ch || "";
       if (hub.name) break;
     }
   }
@@ -563,7 +568,7 @@ async function showsCatalog(skip) {
         6 * 60 * 60 * 1000,
         SITE_REF
       );
-      const hub = hubHtml ? parseShowHub(hubHtml) : { name: "", poster: "", channel: "" };
+      const hub = hubHtml ? parseShowHub(hubHtml, slug) : { name: "", poster: "", channel: "" };
       return {
         id: showId(slug, channel),
         type: "series",
@@ -599,7 +604,7 @@ async function pathForStreamId(id) {
 
     const base = channel ? "/category/" + channel + "/" + slug + "/" : "/category/" + slug + "/";
     const hubHtml = await fetchText(SITE + base, 6 * 60 * 60 * 1000, SITE_REF);
-    channel = channel || parseShowHub(hubHtml).channel;
+    channel = channel || parseShowHub(hubHtml, slug).channel;
     const listUrl = channel
       ? SITE + "/category/" + channel + "/" + slug + "/"
       : SITE + "/category/" + slug + "/";
@@ -693,7 +698,7 @@ async function showsByChannelCatalog(skip) {
     page.map(async ({ slug, channel }) => {
       const hubUrl = SITE + "/category/" + (channel ? channel + "/" : "") + slug + "/";
       const hubHtml = await fetchText(hubUrl, 6 * 60 * 60 * 1000, SITE_REF);
-      const hub = hubHtml ? parseShowHub(hubHtml) : { name: "", poster: "", channel: "" };
+      const hub = hubHtml ? parseShowHub(hubHtml, slug) : { name: "", poster: "", channel: "" };
       const label = channelLabel(channel || hub.channel);
       const name = hub.name || prettify(slug);
       return {

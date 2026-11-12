@@ -104,3 +104,18 @@ test("channel-qualified show ids are routable", async () => {
   // unresolvable selection returns a string, never throws
   assert.equal(typeof (await _test.pathForStreamId("dts:show:star-plus~anupama:zzz")), "string");
 });
+
+test("hub channel detection is slug-scoped", () => {
+  const html = `
+    <nav><a href="/category/star-plus/">Star Plus</a><a href="/category/zee-tv/">Zee TV</a></nav>
+    <a href="/category/and-tv/bhabiji-ghar-par-hain/">Bhabiji</a>
+    <h1>Bhabiji Ghar Par Hain</h1>
+    <img src="/media-cache/abc.jpg">`;
+  // site nav links /category/star-plus/ first: without the slug we get the nav channel
+  assert.equal(_test.parseShowHub(html).channel, "star-plus");
+  // with the slug we get the channel that actually hosts the show
+  assert.equal(_test.parseShowHub(html, "bhabiji-ghar-par-hain").channel, "and-tv");
+  assert.equal(_test.parseShowHub(html, "bhabiji-ghar-par-hain").name, "Bhabiji Ghar Par Hain");
+  // unknown slug falls back to the old behaviour instead of failing
+  assert.equal(_test.parseShowHub(html, "some-other-show").channel, "star-plus");
+});
