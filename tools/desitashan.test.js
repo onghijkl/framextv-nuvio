@@ -66,17 +66,58 @@ test("channel list is deduplicated", () => {
   assert.ok(slugs.includes("star-plus"));
 });
 
-test("series manifest exposes channel + updates rows", () => {
+test("series manifest clones the dashboard rows", () => {
   const m = _test.dssManifest("https://example.test");
   assert.equal(m.id, "org.pvrplay.desitashan.series");
   assert.match(m.version, /^\d+\.\d+\.\d+$/);
   assert.deepEqual(m.resources, ["catalog", "meta", "stream"]);
   assert.ok(m.types.includes("series"));
   const ids = m.catalogs.map((c) => c.id);
-  assert.deepEqual(ids, ["dss:by-channel", "dss:updates", "dss:search"]);
-  assert.equal(m.catalogs[0].type, "series");
+  // dashboard order: spotlight, latest, then every "Watch by Channel" tile, then search
+  assert.deepEqual(ids, [
+    "dss:spotlight",
+    "dss:latest",
+    ..._test.DASH_TILES.map((t) => `dss:ch:${t.slug}`),
+    "dss:search",
+  ]);
+  const names = m.catalogs.map((c) => c.name);
+  assert.equal(names[0], "New Episode Spotlight");
+  assert.equal(names[1], "Latest Desi Tashan Episodes");
+  assert.equal(names[2], "Star Plus");
+  assert.ok(names.includes("Dangal TV"));
+  assert.ok(names.includes("Bigg Boss 20"));
+  assert.equal(m.catalogs[0].type, "movie");
   assert.equal(m.catalogs[1].type, "movie");
+  assert.equal(m.catalogs[2].type, "series");
   assert.notEqual(m.id, _test.dtsManifest("https://example.test").id);
+});
+
+test("dashboard tile + json-ld parsing helpers", () => {
+  assert.equal(_test.DASH_TILES.length, 8);
+  assert.equal(_test.DASH_TILES[0].slug, "star-plus");
+  assert.equal(_test.DASH_TILES[7].slug, "bigg-boss-20");
+  const html = `<script type="application/ld+json">${JSON.stringify({
+    "@graph": [
+      { "@type": "WebSite" },
+      {
+        "@type": "ItemList",
+        itemListElement: [
+          { "@type": "ListItem", url: "https://www.desitashan.su/anupama/0123456789abcdef/", name: "Anupama 12th November 2026 Full Episode | Star Plus" },
+          { "@type": "ListItem", item: { url: "https://www.desitashan.su/tu-juliet-jatt-di/0123456789abcdee/", name: "Tu Juliet Jatt Di", image: { url: "https://cdn.test/p.jpg" } } },
+        ],
+      },
+    ],
+  })}</script>`;
+  const eps = _test.parseJsonLdEpisodes(html);
+  assert.equal(eps.length, 2);
+  assert.deepEqual({ slug: eps[0].slug, pid: eps[0].pid }, { slug: "anupama", pid: "0123456789abcdef" });
+  assert.equal(eps[1].image, "https://cdn.test/p.jpg");
+  assert.equal(_test.dashShowName("Anupama 12th November 2026 Full Episode | Star Plus"), "Anupama");
+  assert.equal(
+    _test.dashShowName("Bigg Boss (Tamil) Season 10 12th November 2026 Full Episode | JioHotstar"),
+    "Bigg Boss (Tamil) Season 10",
+  );
+  assert.equal(_test.dashShowSlug("Bigg Boss (Tamil) Season 10"), "bigg-boss-tamil-season-10");
 });
 
 test("channel labels and title parsing", () => {

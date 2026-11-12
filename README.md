@@ -207,15 +207,21 @@ without the channel/RSS rows of `/dts`.
 
 * Manifest: `https://<worker-host>/dss/manifest.json`
   (addon id `org.pvrplay.desitashan.series`, independently versioned)
-* Catalogs:
-  * `dss:by-channel` (type `series`) — **every show hub exactly once, sorted by
-    channel name and then show name**; each card carries the channel as its
-    `releaseInfo` badge and "`<Channel>` · `<Show>` full episodes" as subtitle.
-    Paginated 20 per page (`?skip=`).
-  * `dss:updates` (type `movie`) — **newest episodes across all channels,
-    newest first** (title dates parsed for ordering/display, channel shown in
-    the subtitle).
-  * `dss:search` — `?search=<query>` over the show list.
+* Catalogs (cloned one-for-one from the desitashan.su dashboard — same rows,
+  same order, same labels):
+  * `dss:spotlight` (type `movie`) — the dashboard's **"New Episode Spotlight"**
+    row (12 highlighted episodes, newest card first).
+  * `dss:latest` (type `movie`) — the dashboard's **"Latest Desi Tashan
+    Episodes"** grid, 32 cards per page, paginated with `?skip=` through the
+    site's own `/page/N/` pages.
+  * `dss:ch:<slug>` (type `series`) — **one row per "Watch by Channel" tile**
+    (`star-plus`, `colors-tv`, `zee-tv`, `sony-tv`, `sab-tv`, `and-tv`,
+    `dangal-tv`, `bigg-boss-20`), each listing that channel's serials sorted by
+    show name, with a `search` extra to filter inside the channel. Shows come
+    from the category sitemap's channel membership *plus* the show names the
+    tile's own page lists (so channels/shows the sitemap never nests, e.g.
+    Dangal TV or the Bigg Boss 20 hub, still get their row).
+  * `dss:search` (type `series`) — `?search=<query>` over every show.
 * Ids are the same `dts:show:<channel>~<slug>` / `dts:ep:<slug>_<pid>` used by
   `/dts`, so meta/stream work from either manifest, and `/dts/p?e=…` playback
   relay is shared.
