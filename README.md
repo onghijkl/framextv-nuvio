@@ -133,3 +133,33 @@ entirely at your own risk and subject to the laws of your jurisdiction.
 ## Licence
 
 GPL-3.0
+---
+
+## Desi Serials (separate catalog addon, mounted at `/desi`)
+
+A second, self-contained addon lives in `addon/desi.js` and is mounted by the
+worker under the `/desi` prefix. It turns **desi-serials.to** into a browsable
+catalogue (no TMDB ids involved).
+
+* Manifest: `https://<worker-host>/desi/manifest.json`
+* Catalogs: `latest` (movie-type items = one episode each, plays immediately),
+  one per channel (`star-plus`, `zee-tv`, `sony-tv`, `color-tv`, `star-bharat`,
+  `sab-tv`, `and-tv`) of type `series`, and a `search` catalog.
+* Ids: series `dser:ser:<channel>~<slug>`, episode `dser:ep:<postId>`.
+* Episodes are numbered `season = year`, `episode = day-of-year` (taken from the
+  date in the post title), so daily serials sort correctly.
+
+### How playback works
+
+1. Episode page → `tvarticles.org/vidd*.php?id=N` mirrors (4, all the same video).
+2. Player page → `flow.tvlogy.to/<skin>/<token>/` embed.
+3. Embed page → signed `https://<host>.tvlogy.to/.../video.m3u8?token=...`.
+
+The token is `base64("<user-agent>||<ips>")` and the CDN **404s unless the
+request carries that exact user-agent and `Referer: https://tvarticles.org/`**.
+ExoPlayer/Nuvio cannot be made to send those, so `addon/desi.js` relays the
+playlists only (`/desi/p?u=<base64url>`): master and variant `.m3u8` go through
+the worker with the right headers, while media segments are rewritten to the CDN
+as absolute URLs and stream directly (segments need no headers at all).
+
+Tests: `node --test tools/desi.test.js` (fixtures in `tools/fixtures-desi/`).

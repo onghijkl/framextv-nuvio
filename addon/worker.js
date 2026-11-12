@@ -3,6 +3,7 @@
 import "../providers/framextv.js";
 import "../providers/pvrplay.js";
 import "../providers/vidlink.js";
+import { handleDesi } from "./desi.js";
 
 /**
  * PvrPlay Catalogs — a Stremio-protocol addon for Nuvio
@@ -1016,6 +1017,11 @@ export default {
     }
 
     try {
+      // Desi Serials — a self-contained catalog addon mounted under /desi.
+      if (path === "/desi" || path.startsWith("/desi/")) {
+        return handleDesi(request, url, `${url.protocol}//${url.host}`);
+      }
+
       if (path === "/" || path === "/manifest.json") {
         return cors(JSON.stringify(manifest()));
       }
