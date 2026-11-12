@@ -663,6 +663,7 @@ function channelLabel(slug) {
  */
 async function seriesShowKeys() {
   const xml = (await fetchText(SITE + "/category-sitemap.xml", 6 * 60 * 60 * 1000, SITE_REF)) || "";
+  const canonical = await showChannelMap();
   const bySlug = new Map();
   for (const key of parseCategorySitemap(xml)) {
     const hasChannel = key.includes("~");
@@ -671,6 +672,9 @@ async function seriesShowKeys() {
     const prev = bySlug.get(slug);
     if (!prev || (!prev.channel && channel)) bySlug.set(slug, { slug, channel });
   }
+  // Use the same canonical channel that showMeta() resolves, so a card's id
+  // and the meta it opens are identical, and a show never appears twice.
+  for (const entry of bySlug.values()) entry.channel = canonical[entry.slug] || entry.channel;
   return [...bySlug.values()].sort((a, b) => {
     const ca = channelLabel(a.channel).toLowerCase();
     const cb = channelLabel(b.channel).toLowerCase();
