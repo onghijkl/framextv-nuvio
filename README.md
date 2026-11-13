@@ -42,8 +42,12 @@ framextv-nuvio/
 ├── manifest.json            provider registry read by Nuvio
 ├── addon/worker.js          Stremio addon + HLS playlist filter (Cloudflare)
 ├── addon/_worker.js         Cloudflare Pages entry point
+├── addon/dss-data/          committed episode index snapshot (see /dss below)
 ├── tools/build.js           src → providers, with validation
 ├── tools/parse.test.js      offline tests for the parsers (no network)
+├── tools/desitashan.test.js offline tests for the desitashan addons
+├── tools/build-dts-index.mjs  builds addon/dss-data/ from the live site
+├── tools/harness-dts.mjs    live end-to-end check of the /dts + /dss routes
 ├── tools/test.js            runs a built provider against live data
 └── .github/workflows/       validates on every push
 ```
@@ -177,6 +181,9 @@ serial episodes (Anupama, Vasudha, Pushpa Impossible, Dilon Ki Ram Leela, …).
   (`dts:ch:<slug>` — `star-plus`, `zee-tv`, `sony-tv`, `sab-tv`, `colors-tv`,
   `and-tv`, `star-bharat`, `dangal-tv`, `mtv`, `sun-neo`), `dts:shows`
   (series-type, browsable channel → show hub → episodes) and `dts:search`.
+  The channel rows and `dts:shows` are served from the committed episode index
+  (see `/dss` below), so each channel lists *every* one of its serials — the
+  category sitemap alone only nests ~50 of them.
 * Ids: series `dts:show:<show-slug>`, episode
   `dts:ep:<episode-slug>_<16-hex-publicId>`.
 * Episodes are numbered `season = year`, `episode = day-of-year` from the date
@@ -205,25 +212,49 @@ A third install point served by the *same* `addon/desitashan.js` module: a
 series-first manifest so the serial library can be added as its own addon
 without the channel/RSS rows of `/dts`.
 
-* Manifest: `https://<worker-host>/dss/manifest.json`
-  (addon id `org.pvrplay.desitashan.series`, independently versioned)
-* Catalogs (cloned one-for-one from the desitashan.su dashboard — same rows,
-  same order, same labels):
-  * `dss:spotlight` (type `movie`) — the dashboard's **"New Episode Spotlight"**
-    row (12 highlighted episodes, newest card first).
-  * `dss:latest` (type `movie`) — the dashboard's **"Latest Desi Tashan
-    Episodes"** grid, 32 cards per page, paginated with `?skip=` through the
-    site's own `/page/N/` pages.
-  * `dss:ch:<slug>` (type `series`) — **one row per "Watch by Channel" tile**
+* Call this add-on **Desi Tashan — Serials** (id
+  `org.pvrplay.desitashan.series`, independently versioned).
+* Catalogs — cloned one-for-one from the desitashan.su **dashboard** (the
+  homepage; the site has no `/dashboard` path) — same rows, same order, same
+  labels. **Every row is `series`**: a card is always a *show hub*, so tapping
+  one opens that show's episode list instead of a single stray episode.
+  * `dss:spotlight` — **"New Episode Spotlight"** (the 12 cards the dashboard
+    highlights), collapsed to the shows they belong to.
+  * `dss:latest` — **"Latest Desi Tashan Episodes"**, as the shows whose newest
+    episode aired most recently, 20 shows per page via `?skip=`.
+  * `dss:ch:<slug>` — **one row per "Watch by Channel" tile** in tile order
     (`star-plus`, `colors-tv`, `zee-tv`, `sony-tv`, `sab-tv`, `and-tv`,
-    `dangal-tv`, `bigg-boss-20`), each listing that channel's serials sorted by
-    show name, with a `search` extra to filter inside the channel. Shows come
-    from the category sitemap's channel membership *plus* the show names the
-    tile's own page lists (so channels/shows the sitemap never nests, e.g.
-    Dangal TV or the Bigg Boss 20 hub, still get their row).
-  * `dss:search` (type `series`) — `?search=<query>` over every show.
+    `dangal-tv`, `bigg-boss-20`), plus the extra channels the site also
+    publishes (`star-bharat`, `mtv`, `sun-neo`, `jiohotstar`,
+    `amazon-mx-player`, `prime-video`, `netflix`).
+  * `dss:all` — every show, A–Z. `dss:search` — `?search=<query>`.
+* Show rows come from the episode index (below), so a channel row lists *all*
+  of its serials, including the many the category sitemap never nests.
 * Ids are the same `dts:show:<channel>~<slug>` / `dts:ep:<slug>_<pid>` used by
-  `/dts`, so meta/stream work from either manifest, and `/dts/p?e=…` playback
-  relay is shared.
+  `/dts`, so meta/stream work from either manifest, and the `/dts/p?e=…`
+  playback relay is shared. `movie` stays in `types` only so meta/stream ids
+  cached by the v1.1.0 install (which had two `movie` rows) keep resolving.
 * Both addons can be installed side by side (different manifest ids), or just
   `/dss` on its own.
+
+### Episode index snapshot (`addon/dss-data/`)
+
+Hub pages only ever show their newest ~20 episodes, and the post sitemaps give
+urls without show membership, so the full per-show episode history is built
+offline and committed as a static snapshot served next to the addon:
+
+```bash
+node tools/build-dts-index.mjs        # -> addon/dss-data/{shows.json,ep/<show>.json}
+node tools/harness-dts.mjs            # end-to-end check of every row + playback
+```
+
+* `shows.json` — `{ show: [channel, episodeCount, latestDate, title, poster, channels[]] }`
+  for every show on the site (207 shows / ~27k episodes at the last build).
+* `ep/<show>.json` — `[[segment, publicId, "YYYY-MM-DD", "xx/<md5>.jpg"]]`,
+  newest first. Rows are read **by shape, not by position**, so an older
+  three-field snapshot still loads (a date must never be mistaken for a poster).
+* The addon `fetch`es these from its own origin and caches them; if the snapshot
+  is missing it falls back to the category sitemap, so a deploy without it
+  still works. Refresh it whenever you want deeper history than the live hub
+  pages provide — new episodes are always merged in from the live hub page, so
+  a stale snapshot never hides a fresh episode.

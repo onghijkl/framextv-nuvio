@@ -73,23 +73,31 @@ test("series manifest clones the dashboard rows", () => {
   assert.deepEqual(m.resources, ["catalog", "meta", "stream"]);
   assert.ok(m.types.includes("series"));
   const ids = m.catalogs.map((c) => c.id);
-  // dashboard order: spotlight, latest, then every "Watch by Channel" tile, then search
-  assert.deepEqual(ids, [
-    "dss:spotlight",
-    "dss:latest",
-    ..._test.DASH_TILES.map((t) => `dss:ch:${t.slug}`),
-    "dss:search",
-  ]);
   const names = m.catalogs.map((c) => c.name);
+  const tiles = _test.DASH_TILES.map((t) => `dss:ch:${t.slug}`);
+  // dashboard order first: spotlight, latest, then every "Watch by Channel" tile
+  assert.deepEqual(ids.slice(0, 2), ["dss:spotlight", "dss:latest"]);
+  assert.deepEqual(ids.slice(2, 2 + tiles.length), tiles);
   assert.equal(names[0], "New Episode Spotlight");
   assert.equal(names[1], "Latest Desi Tashan Episodes");
   assert.equal(names[2], "Star Plus");
   assert.ok(names.includes("Dangal TV"));
   assert.ok(names.includes("Bigg Boss 20"));
-  assert.equal(m.catalogs[0].type, "movie");
-  assert.equal(m.catalogs[1].type, "movie");
-  assert.equal(m.catalogs[2].type, "series");
+  // extra channels + browse rows come after the dashboard clone
+  for (const id of ["dss:all", "dss:search"]) assert.ok(ids.includes(id), `${id} missing`);
+  assert.deepEqual(ids.slice(-2), ["dss:all", "dss:search"]);
   assert.notEqual(m.id, _test.dtsManifest("https://example.test").id);
+});
+
+test("every /dss row is a series row (a card is always a show hub)", () => {
+  const m = _test.dssManifest("https://example.test");
+  for (const c of m.catalogs) {
+    assert.equal(c.type, "series", `${c.id} should be type series`);
+    assert.equal(c.contentType, undefined);
+  }
+  // `movie` stays advertised so meta/stream ids cached by the v1.1.0 install
+  // (which had two movie rows) keep resolving.
+  assert.deepEqual(m.types, ["series", "movie"]);
 });
 
 test("dashboard tile + json-ld parsing helpers", () => {
@@ -159,4 +167,29 @@ test("hub channel detection is slug-scoped", () => {
   assert.equal(_test.parseShowHub(html, "bhabiji-ghar-par-hain").name, "Bhabiji Ghar Par Hain");
   // unknown slug falls back to the old behaviour instead of failing
   assert.equal(_test.parseShowHub(html, "some-other-show").channel, "star-plus");
+});
+
+test("snapshot rows keep their poster (iso date must not be read as an image)", () => {
+  // the built index writes [segment, publicId, "YYYY-MM-DD", "xx/<md5>.jpg"] —
+  // reading row[2] as the image made every episode outside the hub's first page
+  // render its date as a poster (media-cache/2025-12-27).
+  const rows = _test.parseEpisodesPayload([
+    ["naagin-7-27th-december-2025-full-episode-colors-tv", "aa66c8d57e5c4a41", "2025-12-27", "aa/aa8018bf.jpg"],
+    ["old-shape-episode-full-episode-star-plus", "0123456789abcdef", "bb/bb1234.jpg"],
+    ["broken-row"],
+  ]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].iso, "2025-12-27");
+  assert.equal(rows[0].image, "https://www.desitashan.su/media-cache/aa/aa8018bf.jpg");
+  assert.equal(rows[1].iso, "");
+  assert.equal(rows[1].image, "https://www.desitashan.su/media-cache/bb/bb1234.jpg");
+  assert.ok(!/media-cache\/\d{4}-\d{2}-\d{2}/.test(rows[0].image));
+});
+
+test("iso dates come from the snapshot instead of being re-derived from the slug", () => {
+  const rows = _test.parseEpisodesPayload([
+    ["mystery-show-3rd-january-2026-full-episode-colors-tv", "ad49a1c96e7c0d97", "2026-01-03", "aa/x.jpg"],
+  ]);
+  assert.equal(rows[0].iso, "2026-01-03");
+  assert.equal(_test.segInfo(rows[0].seg, "mystery-show").iso, "2026-01-03");
 });

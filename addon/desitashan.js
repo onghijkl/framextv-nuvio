@@ -33,10 +33,10 @@ const SITE_REF = "https://www.desitashan.su/";
 const FREEZOD_PLAY = "https://freezod.com/hls-synapsixto/";
 const FREEZOD_META = "https://freezod.com/hls-synapsixto/media_meta.php";
 
-const ADDON_VERSION = "1.1.1";
+const ADDON_VERSION = "1.2.0";
 // The series-only add-on (/dss) is versioned independently from the add-on
 // that carries channels + search (/dts).
-const SERIES_VERSION = "1.1.0";
+const SERIES_VERSION = "1.2.0";
 
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 " +
@@ -54,6 +54,10 @@ const CHANNELS = [
   { slug: "dangal-tv", name: "Dangal TV" },
   { slug: "mtv", name: "MTV" },
   { slug: "sun-neo", name: "Sun Neo" },
+  { slug: "jiohotstar", name: "JioHotstar" },
+  { slug: "amazon-mx-player", name: "Amazon MX Player" },
+  { slug: "prime-video", name: "Prime Video" },
+  { slug: "netflix", name: "Netflix" },
 ];
 
 const CHANNEL_NAMES = Object.fromEntries(CHANNELS.map((c) => [c.slug, c.name]));
@@ -436,102 +440,344 @@ async function episodeMeta(id) {
 }
 
 /** slug -> owning channel, derived from the nested /category/<ch>/<show>/ sitemap. */
-async function showChannelMap() {
-  const xml = (await fetchText(SITE + "/category-sitemap.xml", 6 * 60 * 60 * 1000, SITE_REF)) || "";
-  const map = {};
-  const re = /<loc>[^<]*\/category\/([a-z0-9][a-z0-9-]+)\/([a-z0-9][a-z0-9-]+)\/<\/loc>/g;
-  let m;
-  while ((m = re.exec(xml))) if (!map[m[2]]) map[m[2]] = m[1];
-  return map;
+/* ------------------------------------------------------------ series index --
+ * /category-sitemap.xml nests only ~50 of the ~207 serials the site carries and
+ * the "Watch by Channel" pages advertise just the shows that aired in the last
+ * few weeks, so the add-on reads a snapshot of the site's sitemap built by
+ * tools/build-dts-index.mjs and published with this deployment:
+ *
+ *   /dss-data/shows.json      every serial: channel, episode count, name, poster
+ *   /dss-data/ep/<slug>.json  every episode of one serial (seg + public id)
+ *
+ * The live hub page is always merged on top, so episodes appear the day they air.
+ */
+const DTS_DATA_DIR = "/dss-data";
+const DTS_INDEX_TTL = 6 * 60 * 60 * 1000;
+const DTS_MONTHS = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+];
+const DTS_MONTH_LABELS = DTS_MONTHS.map((n) => n[0].toUpperCase() + n.slice(1));
+const DTS_MONTH_INDEX = {};
+DTS_MONTHS.forEach((n, i) => {
+  DTS_MONTH_INDEX[n.slice(0, 3)] = i;
+});
+let DTS_INDEX_MEM = null;
+
+function isoFromParts(day, monthName, year) {
+  const at = DTS_MONTH_INDEX[String(monthName || "").toLowerCase().slice(0, 3)];
+  if (at === undefined) return "";
+  return year + "-" + String(at + 1).padStart(2, "0") + "-" + String(day).padStart(2, "0");
 }
 
-/** Show hub + its channel listing -> series meta with videos[]. */
-async function showMeta(id) {
-  const raw = String(id).replace(/^dts:show:/, "");
-  const parts = raw.split("~");
-  const slug = parts.length > 1 ? parts[1] : parts[0];
-  let channel = parts.length > 1 ? parts[0] : "";
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return null;
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(channel)) channel = "";
+function prettyDate(iso) {
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  const label = DTS_MONTH_LABELS[Number(m[2]) - 1];
+  if (!label) return "";
+  return Number(m[3]) + " " + label + " " + m[1];
+}
 
-  const map = await showChannelMap();
-  // The sitemap knows which channel hosts a show; the id is just a hint.
-  const resolved = map[slug] || channel;
-  const cands = [resolved, channel, ""].filter((c, i, a) => c !== undefined && a.indexOf(c) === i);
+/**
+ * Episode segments look like
+ * `naagin-7-14th-june-2026-full-episode-colors-tv` — the date is the last
+ * `-<day><ordinal>-<month>-<year>` group and anything between the serial slug
+ * and that date ("written-update", "maha-episode", …) is episode specific.
+ */
+function segInfo(seg, serialSlug) {
+  const raw = String(seg || "");
+  const re = /-(\d{1,2})(?:st|nd|rd|th)?-([a-z]+)-(\d{4})(?=-|$)/g;
+  let m;
+  let last = null;
+  while ((m = re.exec(raw))) last = m;
+  if (!last) return { iso: "", extra: "" };
+  let head = raw.slice(0, last.index);
+  if (serialSlug && head.indexOf(serialSlug) === 0) head = head.slice(serialSlug.length);
+  return { iso: isoFromParts(last[1], last[2], last[3]), extra: head.replace(/^-+|-+$/g, "") };
+}
 
-  let hubHtml = "";
-  let hub = { name: "", poster: "", channel: "" };
-  for (const ch of cands) {
-    const url = SITE + "/category/" + (ch ? ch + "/" : "") + slug + "/";
-    const html = await fetchText(url, 6 * 60 * 60 * 1000, SITE_REF);
-    if (!html) continue;
-    const parsed = parseShowHub(html, slug);
-    if (!hub.poster && parsed.poster) {
-      hubHtml = html;
-      hub = parsed;
-      channel = parseShowHub(html, slug).channel || ch || "";
-      if (hub.name) break;
+function indexEntry(slug, row) {
+  const channels = Array.isArray(row[5]) && row[5].length ? row[5] : row[0] ? [row[0]] : [];
+  return {
+    slug: slug,
+    channel: row[0] || channels[0] || "",
+    channels: channels,
+    count: Number(row[1]) || 0,
+    newest: row[2] || "",
+    name: row[3] || prettify(slug),
+    poster: row[4] ? abs(row[4]) : "",
+  };
+}
+
+function indexFromShows(shows) {
+  const index = new Map();
+  for (const slug of Object.keys(shows || {})) index.set(slug, indexEntry(slug, shows[slug]));
+  return index;
+}
+
+/** Every serial on the site, newest episode first (falls back to the sitemap). */
+async function dtsIndex(origin) {
+  if (DTS_INDEX_MEM && Date.now() - DTS_INDEX_MEM.at < DTS_INDEX_TTL) return DTS_INDEX_MEM;
+  let shows = new Map();
+  let built = "";
+  if (origin) {
+    try {
+      const res = await fetchRaw(new URL(DTS_DATA_DIR + "/shows.json", origin).toString(), { timeout: 12000 });
+      if (res && res.ok) {
+        const raw = await res.json();
+        shows = indexFromShows(raw && raw.shows);
+        built = (raw && raw.built) || "";
+      }
+    } catch (err) {
+      // snapshot unavailable (plain worker deploy) -> degraded sitemap mode
     }
   }
-  if (!hubHtml) return null;
-  const listingUrl = channel
-    ? SITE + "/category/" + channel + "/" + slug + "/"
-    : SITE + "/category/" + slug + "/";
-  const listHtml = await fetchText(listingUrl, 30 * 60 * 1000, SITE_REF);
-  let eps = parseCards(listHtml);
-  if (!eps.length) eps = parseCards(hubHtml);
+  if (!shows.size) {
+    for (const key of await parseCategorySitemap()) {
+      if (typeof key !== "string" || !key) continue;
+      const at = key.indexOf("~");
+      const channel = at > 0 ? key.slice(0, at) : "";
+      const slug = at > 0 ? key.slice(at + 1) : key;
+      if (!slug || shows.has(slug)) continue;
+      shows.set(slug, {
+        slug: slug,
+        channel: channel,
+        channels: channel ? [channel] : [],
+        count: 0,
+        newest: "",
+        name: prettify(slug),
+        poster: "",
+      });
+    }
+  }
+  DTS_INDEX_MEM = { at: Date.now(), built: built, shows: shows };
+  return DTS_INDEX_MEM;
+}
 
-  const videos = eps.map((e, i) => ({
-    id: e.id,
-    title: cleanEpisodeTitle(e.title) || e.title,
+async function indexShows(origin) {
+  return [...(await dtsIndex(origin)).shows.values()];
+}
+
+function byNewest(a, b) {
+  return String(b.newest || "").localeCompare(String(a.newest || "")) || a.name.localeCompare(b.name);
+}
+
+/** Serials that air on / were posted under one channel, A-Z. */
+function channelIndexShows(index, channelSlug) {
+  const out = [];
+  for (const show of index.values()) {
+    if (show.channel === channelSlug || show.channels.indexOf(channelSlug) >= 0) out.push(show);
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function searchIndexShows(index, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return [];
+  const out = [];
+  for (const show of index.values()) {
+    const names = [show.name, show.slug, channelLabel(show.channel)]
+      .concat(show.channels.map((c) => channelLabel(c)))
+      .join(" ")
+      .toLowerCase();
+    if (names.indexOf(q) >= 0) out.push(show);
+  }
+  return out.sort(byNewest);
+}
+
+/** Series card for a catalog row — no network, the index has name + poster. */
+function indexCard(show, label) {
+  const channel = label || channelLabel(show.channel) || "Desi Tashan";
+  const bits = [channel];
+  if (show.newest) bits.push(prettyDate(show.newest));
+  if (show.count) bits.push(show.count + (show.count === 1 ? " episode" : " episodes"));
+  return {
+    id: showId(show.slug, show.channel),
+    type: "series",
+    name: show.name || prettify(show.slug),
+    poster: show.poster || FALLBACK_POSTER,
+    posterShape: "landscape",
+    description: bits.join(" · "),
+    releaseInfo: channel,
+  };
+}
+
+/**
+ * Snapshot rows `[segment, publicId, "YYYY-MM-DD", "xx/<md5>.jpg"]` -> episode
+ * records. Older snapshots only carried `[segment, publicId, imagePath]`, so
+ * pick the fields by shape instead of by position.
+ */
+function parseEpisodesPayload(rows) {
+  const out = [];
+  if (!Array.isArray(rows)) return out;
+  for (const row of rows) {
+    if (!Array.isArray(row) || !row[0] || !row[1]) continue;
+    let iso = "";
+    let img = "";
+    for (let i = 2; i < row.length; i++) {
+      const v = row[i] == null ? "" : String(row[i]).trim();
+      if (!v) continue;
+      if (/^\d{4}-\d{2}-\d{2}/.test(v)) {
+        if (!iso) iso = v.slice(0, 10);
+        continue;
+      }
+      if (!img && (/\.(?:jpe?g|png|webp)$/i.test(v) || v.indexOf("/") > -1)) img = v;
+    }
+    out.push({
+      seg: String(row[0]),
+      pid: String(row[1]),
+      iso: iso,
+      image: img ? SITE + "/media-cache/" + img.replace(/^\/?media-cache\//, "") : "",
+    });
+  }
+  return out;
+}
+
+/**
+ * The complete episode list of one serial: the snapshot (every episode the site
+ * ever indexed) merged with the live hub page, newest first. The site's own
+ * episode numbers are unreliable, so numbers are assigned by date, newest =
+ * highest — showMeta and pathForStreamId share this list so they always agree.
+ */
+async function showEpisodes(serialSlug, channel, origin) {
+  const found = new Map();
+  const add = (seg, pid, image, live, iso) => {
+    if (!seg || !pid) return;
+    const prev = found.get(pid);
+    if (prev) {
+      if (live) {
+        if (live.title) prev.title = live.title;
+        if (live.image) prev.image = abs(live.image);
+      }
+      if (iso && !prev.date) prev.date = iso;
+      return;
+    }
+    found.set(pid, {
+      seg: seg,
+      pid: pid,
+      image: abs(image || ""),
+      title: live && live.title ? live.title : "",
+      date: iso || segInfo(seg, serialSlug).iso,
+    });
+  };
+  if (origin) {
+    try {
+      const res = await fetchRaw(new URL(DTS_DATA_DIR + "/ep/" + serialSlug + ".json", origin).toString(), {
+        timeout: 12000,
+      });
+      if (res && res.ok) {
+        for (const row of parseEpisodesPayload(await res.json()))
+          add(row.seg, row.pid, row.image, null, row.iso);
+      }
+    } catch (err) {
+      // no snapshot for this serial (brand new show) -> live pages only
+    }
+  }
+  const cards = parseCards(await fetchShowHub(serialSlug, channel));
+  for (const card of cards) {
+    if (!card.slug || !card.pid) continue;
+    if (card.slug !== serialSlug && card.slug.indexOf(serialSlug + "-") !== 0) continue;
+    add(card.slug, card.pid, card.image, { title: cleanEpisodeTitle(card.title), image: card.image });
+  }
+  const list = [...found.values()].sort((a, b) => {
+    return String(b.date || "").localeCompare(String(a.date || "")) || a.seg.localeCompare(b.seg);
+  });
+  const total = list.length;
+  return list.map((ep, i) => ({
+    id: episodeId(ep.seg, ep.pid),
     season: 1,
-    episode: e.episode || eps.length - i,
-    thumbnail: e.image || "",
-    released: e.released || undefined,
+    episode: total - i,
+    title: ep.title || (prettify(serialSlug) + " " + prettyDate(ep.date)).trim(),
+    released: ep.date ? ep.date + "T00:00:00.000Z" : "",
+    thumbnail: ep.image || "",
+    seg: ep.seg,
+    pid: ep.pid,
   }));
+}
 
+/** Hub (serial landing) page, channel-qualified when we know the channel. */
+async function fetchShowHub(serialSlug, channel) {
+  const paths = channel
+    ? ["/category/" + channel + "/" + serialSlug + "/", "/category/" + serialSlug + "/"]
+    : ["/category/" + serialSlug + "/"];
+  for (const path of paths) {
+    const html = await fetchText(SITE + path, 6 * 60 * 60 * 1000, SITE_REF);
+    if (html) return html;
+  }
+  return "";
+}
+
+/** Serial slug of an episode segment: `…-12th-november-2026-full-episode-x-tv`. */
+function segShowSlug(seg) {
+  const raw = String(seg || "");
+  const re = /-(\d{1,2})(?:st|nd|rd|th)?-([a-z]+)-(\d{4})(?=-|$)/g;
+  let m;
+  let last = null;
+  while ((m = re.exec(raw))) last = m;
+  const head = last ? raw.slice(0, last.index) : raw;
+  return head.replace(/^-+|-+$/g, "");
+}
+
+/** Series card for a serial the snapshot does not know yet (brand new show). */
+
+/** Show hub + its channel listing -> series meta with videos[]. */
+/**
+ * Series meta for `dts:show:<channel>~<slug>[:<season>:<episode>]` carrying the
+ * COMPLETE episode list of the serial (snapshot + live hub page).
+ */
+async function showMeta(id, origin) {
+  const m = String(id).match(/^dts:show:(?:(.+?)~)?(.+?)(?::(.*))?$/);
+  if (!m) return null;
+  const slug = m[2];
+  const index = await dtsIndex(origin);
+  const entry = index.shows.get(slug);
+  let channel = m[1] || (entry ? entry.channel : "");
+  let hub = null;
+  if (!entry || !entry.name || !entry.poster) {
+    hub = parseShowHub(await fetchShowHub(slug, channel), slug);
+  }
+  if (!channel && hub) channel = hub.channel;
+  const name = (entry && entry.name) || (hub && hub.name) || prettify(slug);
+  const poster = (entry && entry.poster) || (hub && hub.poster) || FALLBACK_POSTER;
+  const label = channelLabel(channel) || "Desi Tashan";
+  const videos = await showEpisodes(slug, channel, origin);
+  const release = entry && entry.newest ? "Latest " + prettyDate(entry.newest) : label;
   return {
     id: showId(slug, channel),
     type: "series",
-    name: hub.name || prettify(slug),
-    poster: hub.poster || (eps[0] && eps[0].image) || FALLBACK_POSTER,
+    name: name,
+    poster: poster,
     posterShape: "landscape",
+    background: poster,
+    logo: poster,
     description:
-      (hub.name || prettify(slug)) + (channel ? " — " + (CHANNEL_NAMES[channel] || channel) : "") +
-      ", latest episodes.",
-    videos,
+      label +
+      " · " +
+      videos.length +
+      (videos.length === 1 ? " episode" : " episodes") +
+      " · complete episode list, no ads",
+    releaseInfo: release,
+    genres: [label],
+    videos: videos,
   };
 }
 
 /* -------------------------------------------------------------- catalogs */
 
-async function latestCatalog(skip) {
-  const url = SITE + "/sidebar-feed.php?limit=" + PAGE_SIZE + "&offset=" + skip;
-  let items = [];
-  const body = await fetchText(url, 5 * 60 * 1000, SITE_REF);
-  if (body) {
-    try {
-      const data = JSON.parse(body);
-      items = Array.isArray(data.latest) ? data.latest : [];
-    } catch {
-      items = [];
-    }
-  }
-
-  if (!items.length && skip === 0) {
-    const feed = parseFeed(await fetchText(SITE + "/feed.xml", 5 * 60 * 1000, SITE_REF));
-    return feed.slice(0, 50).map((e) =>
-      metaCard(e.slug, e.pid, e.title, e.image, e.released)
-    );
-  }
-
-  return items
-    .map((it) => {
-      const m = String(it.url || "").match(/\/([a-z0-9][a-z0-9-]*)\/([a-f0-9]{16})\/?$/);
-      if (!m) return null;
-      return metaCard(m[1], m[2], text(it.title) || prettify(m[1]), abs(it.image || ""), "");
-    })
-    .filter(Boolean);
+/** /dts "Latest" row — serials ordered by their newest episode. */
+async function latestCatalog(skip, origin) {
+  const shows = (await indexShows(origin)).sort(byNewest);
+  return showRowCatalog(shows, skip, "", origin);
 }
 
 function metaCard(slug, pid, name, poster, released) {
@@ -545,22 +791,16 @@ function metaCard(slug, pid, name, poster, released) {
   };
 }
 
-async function channelCatalog(slug, skip) {
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return [];
-  const page = Math.floor(skip / PAGE_SIZE) + 1;
-  const url = page === 1 ? SITE + "/category/" + slug + "/" : SITE + "/category/" + slug + "/page/" + page + "/";
-  const html = await fetchText(url, 10 * 60 * 1000, SITE_REF);
-  return parseCards(html).map((e) => metaCard(e.slug, e.pid, e.title, e.image, e.released));
+/** /dts per-channel row — every serial of that channel, A-Z. */
+async function channelCatalog(slug, skip, origin) {
+  const index = await dtsIndex(origin);
+  return showRowCatalog(channelIndexShows(index.shows, slug), skip, "", origin);
 }
 
-async function searchCatalog(query, skip) {
-  const q = String(query || "").trim();
-  if (!q) return [];
-  const page = Math.floor(skip / PAGE_SIZE) + 1;
-  const base = SITE + "/search/" + encodeURIComponent(q).replace(/%20/g, "+");
-  const url = page === 1 ? base : base + "/page/" + page + "/";
-  const html = await fetchText(url, 5 * 60 * 1000, SITE_REF);
-  return parseCards(html).map((e) => metaCard(e.slug, e.pid, e.title, e.image, e.released));
+/** /dts search — serials whose name, slug or channel matches. */
+async function searchCatalog(query, skip, origin) {
+  const index = await dtsIndex(origin);
+  return showRowCatalog(searchIndexShows(index.shows, query), skip, "", origin);
 }
 
 /**
@@ -568,69 +808,40 @@ async function searchCatalog(query, skip) {
  * Posters come from the hub page (og:image); the hub also names its channel,
  * which showMeta() then reuses for the full episode list.
  */
-async function showsCatalog(skip) {
-  const xml = await fetchText(SITE + "/category-sitemap.xml", 12 * 60 * 60 * 1000, SITE_REF);
-  const slugs = parseCategorySitemap(xml);
-  const page = slugs.slice(skip, skip + PAGE_SIZE);
-  if (!page.length) return [];
-
-  const enriched = await Promise.all(
-    page.map(async (key) => {
-      const channel = key.includes("~") ? key.split("~")[0] : "";
-      const slug = key.includes("~") ? key.split("~")[1] : key;
-      const hubHtml = await fetchText(
-        SITE + "/category/" + (channel ? channel + "/" : "") + slug + "/",
-        6 * 60 * 60 * 1000,
-        SITE_REF
-      );
-      const hub = hubHtml ? parseShowHub(hubHtml, slug) : { name: "", poster: "", channel: "" };
-      return {
-        id: showId(slug, channel),
-        type: "series",
-        name: hub.name || prettify(slug),
-        poster: hub.poster || FALLBACK_POSTER,
-        posterShape: "landscape",
-        description: channel ? CHANNEL_NAMES[channel] || prettify(channel) : undefined,
-      };
-    })
-  );
-  return enriched;
+/** /dts "All serials" row — the whole library, A-Z. */
+async function showsCatalog(skip, origin) {
+  const shows = (await indexShows(origin)).sort((a, b) => a.name.localeCompare(b.name));
+  return showRowCatalog(shows, skip, "", origin);
 }
 
 /* ---------------------------------------------------------------- streams */
 
 /** Resolve a playable episode path out of any id form a client may send. */
-async function pathForStreamId(id) {
+/** Resolve a stream id to the on-site episode path (used by handleStream). */
+async function pathForStreamId(id, origin) {
   const raw = String(id || "");
 
-  // dts:ep:<slug>_<pid>
+  // dts:ep:<episode-segment>_<publicId>
   let m = raw.match(/dts:ep:(.+)_([a-f0-9]{16})$/);
   if (m) return episodePath(m[1], m[2]);
 
-  // dts:show:<channel>~<slug>[:<season>:<episode>]  (channel part optional)
+  // dts:show:<channel>~<slug>[:<season>:<episode>]
   m = raw.match(/dts:show:([a-z0-9][a-z0-9-]*(?:~[a-z0-9][a-z0-9-]*)?)(?::(.*))?$/);
   if (m) {
     const parts = m[1].split("~");
     const slug = parts.length > 1 ? parts[1] : parts[0];
-    let channel = parts.length > 1 ? parts[0] : "";
+    const channel = parts.length > 1 ? parts[0] : "";
     const sel = (m[2] || "").split(":").filter(Boolean);
     const pid = sel.find((s) => HEX_ID.test(s));
     if (pid) return episodePath(slug, pid);
 
-    const base = channel ? "/category/" + channel + "/" + slug + "/" : "/category/" + slug + "/";
-    const hubHtml = await fetchText(SITE + base, 6 * 60 * 60 * 1000, SITE_REF);
-    channel = channel || parseShowHub(hubHtml, slug).channel;
-    const listUrl = channel
-      ? SITE + "/category/" + channel + "/" + slug + "/"
-      : SITE + "/category/" + slug + "/";
-    const eps = parseCards(await fetchText(listUrl, 30 * 60 * 1000, SITE_REF));
-    if (!eps.length) return "";
+    // exactly the list (and numbering) showMeta returned
+    const videos = await showEpisodes(slug, channel, origin);
+    if (!videos.length) return "";
     const nums = sel.map(Number).filter((n) => Number.isFinite(n) && n > 0);
     const want = nums.length ? nums[nums.length - 1] : 1;
-    const byNumber = eps.find((e) => e.episode === want);
-    if (byNumber) return episodePath(byNumber.slug, byNumber.pid);
-    const byIndex = eps[want - 1] || eps[0];
-    return episodePath(byIndex.slug, byIndex.pid);
+    const hit = videos.find((v) => v.episode === want) || videos[0];
+    return episodePath(hit.seg, hit.pid);
   }
 
   // bare public id — only usable if we saw it in a listing this isolate
@@ -681,78 +892,28 @@ function channelLabel(slug) {
  * name and then show name. Channel-qualified sitemap keys win over flat ones,
  * because they already carry the hub path.
  */
-async function seriesShowKeys() {
-  const xml = (await fetchText(SITE + "/category-sitemap.xml", 6 * 60 * 60 * 1000, SITE_REF)) || "";
-  const canonical = await showChannelMap();
-  const bySlug = new Map();
-  for (const key of parseCategorySitemap(xml)) {
-    const hasChannel = key.includes("~");
-    const channel = hasChannel ? key.split("~")[0] : "";
-    const slug = hasChannel ? key.split("~")[1] : key;
-    const prev = bySlug.get(slug);
-    if (!prev) bySlug.set(slug, { slug, channel, channels: channel ? [channel] : [] });
-    else if (channel && !prev.channels.includes(channel)) {
-      prev.channels.push(channel);
-      if (!prev.channel) prev.channel = channel;
-    }
-  }
-  // Use the same canonical channel that showMeta() resolves, so a card's id
-  // and the meta it opens are identical, and a show never appears twice.
-  for (const entry of bySlug.values()) {
-    entry.channel = canonical[entry.slug] || entry.channel;
-    if (entry.channel && !entry.channels.includes(entry.channel)) entry.channels.push(entry.channel);
-  }
-  return [...bySlug.values()].sort((a, b) => {
-    const ca = channelLabel(a.channel).toLowerCase();
-    const cb = channelLabel(b.channel).toLowerCase();
-    if (ca !== cb) return ca < cb ? -1 : 1;
-    const sa = prettify(a.slug).toLowerCase();
-    const sb = prettify(b.slug).toLowerCase();
-    return sa < sb ? -1 : sa > sb ? 1 : 0;
-  });
+/** Every serial the site carries, plus channel/count/newest metadata. */
+async function seriesShowKeys(origin) {
+  return indexShows(origin);
 }
 
 /** Row 1 — shows ordered by channel name, then show name. */
-async function showsByChannelCatalog(skip) {
-  const keys = await seriesShowKeys();
-  const page = keys.slice(skip, skip + PAGE_SIZE);
-  return Promise.all(
-    page.map(async ({ slug, channel }) => {
-      const hubUrl = SITE + "/category/" + (channel ? channel + "/" : "") + slug + "/";
-      const hubHtml = await fetchText(hubUrl, 6 * 60 * 60 * 1000, SITE_REF);
-      const hub = hubHtml ? parseShowHub(hubHtml, slug) : { name: "", poster: "", channel: "" };
-      const label = channelLabel(channel || hub.channel);
-      const name = hub.name || prettify(slug);
-      return {
-        id: showId(slug, channel || hub.channel),
-        type: "series",
-        name,
-        poster: hub.poster || FALLBACK_POSTER,
-        posterShape: "landscape",
-        description: label + " · " + name + " full episodes",
-        releaseInfo: label,
-      };
-    })
-  );
+/** Hidden fallback row: every serial grouped by channel then name. */
+async function showsByChannelCatalog(skip, origin) {
+  const shows = await indexShows(origin);
+  shows.sort((a, b) => {
+    const ca = channelLabel(a.channel) || "zzz";
+    const cb = channelLabel(b.channel) || "zzz";
+    return ca.localeCompare(cb) || a.name.localeCompare(b.name);
+  });
+  return showRowCatalog(shows, skip, "", origin);
 }
 
 /** Row 2 — newest episodes across every channel, newest first. */
-async function updatesCatalog(skip) {
-  const metas = await latestCatalog(skip);
-  return metas
-    .map((m) => ({ ...m, _t: titleDate(m.name) }))
-    .sort((a, b) => (b._t || 0) - (a._t || 0))
-    .map((m) => {
-      const channel = titleChannel(m.name);
-      const out = {
-        ...m,
-        name: cleanEpisodeTitle(m.name),
-        releaseInfo: channel || m.releaseInfo,
-      };
-      delete out._t;
-      if (channel) out.description = channel + " · New episode";
-      return out;
-    });
+/** Hidden fallback row: serials ordered by their newest episode. */
+async function updatesCatalog(skip, origin) {
+  const shows = (await indexShows(origin)).sort(byNewest);
+  return showRowCatalog(shows, skip, "", origin);
 }
 
 /** "Anupama 12th November 2026 Full Episode | Star Plus" -> "Anupama 12 November 2026" */
@@ -767,11 +928,14 @@ function cleanEpisodeTitle(title) {
 /* ---------------------------------------------------------------------------
  * Dashboard clone (/dss) — the catalogs below are cloned one-for-one from the
  * desitashan.su dashboard (homepage), keeping its order and labels:
- *   "New Episode Spotlight"         -> dss:spotlight  (movie)
- *   "Latest Desi Tashan Episodes"   -> dss:latest     (movie, 32/page)
+ *   "New Episode Spotlight"         -> dss:spotlight  (series: the shows it highlights)
+ *   "Latest Desi Tashan Episodes"   -> dss:latest     (series, 32/page)
  *   "Watch by Channel" (8 tiles)    -> dss:ch:<slug>  (series: that channel's shows)
- *   search box                      -> dss:search     (series)
- * ------------------------------------------------------------------------- */
+ *   search box + full index         -> dss:search / dss:all
+ *
+ * Every row is `series`: a card is always a show hub (tap -> that show's episode
+ * list), never a bare episode, so the client never has to guess what a card is.
+ * Episode ids stay identical to /dts, so meta/stream resolve from either addon.
 
 /** "Watch by Channel" tiles, exactly as the dashboard lists them (order + labels). */
 const DASH_TILES = [
@@ -817,53 +981,91 @@ function parseJsonLdEpisodes(html) {
   return out;
 }
 
-/** Dashboard card -> meta (same episode ids as /dts, so meta + stream work from either addon). */
-function dashEpisodeCard(e) {
-  const meta = metaCard(e.slug, e.pid, cleanEpisodeTitle(e.title), e.image, e.released);
-  const ch = titleChannel(e.title) || slugChannel(e.slug);
-  if (ch) meta.description = channelLabel(ch) || ch;
-  return meta;
+/**
+ * Map an episode card (or a dashboard JSON-LD entry) to the serial it belongs
+ * to, by matching the episode slug against the index (longest show slug wins).
+ */
+function matchShowSlug(card, index) {
+  if (!card) return "";
+  if (card.showKey) {
+    const slug = String(card.showKey).split("/").pop();
+    if (index.has(slug)) return slug;
+  }
+  const seg = String(card.slug || "");
+  let best = "";
+  for (const slug of index.keys()) {
+    if ((seg === slug || seg.startsWith(`${slug}-`)) && slug.length > best.length) best = slug;
+  }
+  return best;
 }
 
 /** "Latest Desi Tashan Episodes" — the dashboard's main episode grid. */
-async function dashLatestCatalog(skip) {
-  const page = Math.floor(skip / DASH_PAGE_SIZE) + 1;
-  const html = await fetchText(page <= 1 ? SITE + "/" : SITE + "/page/" + page + "/", 5 * 60 * 1000, SITE_REF);
-  let items = parseJsonLdEpisodes(html);
-  if (!items.length) items = parseCards(html);
-  const offset = skip % DASH_PAGE_SIZE;
-  return items.slice(offset, offset + DASH_PAGE_SIZE).map(dashEpisodeCard);
+/** "Latest Desi Tashan Episodes" — every serial, newest episode first. */
+async function dashLatestCatalog(skip, origin) {
+  const shows = (await indexShows(origin)).sort(byNewest);
+  return showRowCatalog(shows, skip, "", origin);
 }
 
 /** "New Episode Spotlight" — the highlighted row at the top of the dashboard. */
-async function dashSpotlightCatalog() {
-  const html = await fetchText(SITE + "/", 5 * 60 * 1000, SITE_REF);
-  const items = parseCards(html).slice(0, DASH_SPOTLIGHT_MAX);
-  return items.map(dashEpisodeCard);
+/**
+ * "New Episode Spotlight" — the serials behind the homepage's spotlight cards,
+ * in the order the dashboard shows them, as complete series entries.
+ */
+async function dashSpotlightCatalog(origin) {
+  const index = (await dtsIndex(origin)).shows;
+  const html = await fetchText(`${SITE}/`, 5 * 60 * 1000, SITE_REF);
+  const rows = [];
+  const seen = new Set();
+  for (const card of [...parseJsonLdEpisodes(html), ...parseCards(html)]) {
+    const slug = matchShowSlug(card, index);
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    rows.push(index.get(slug));
+    if (rows.length >= DASH_SPOTLIGHT_MAX) break;
+  }
+  if (!rows.length) rows.push(...(await indexShows(origin)).sort(byNewest).slice(0, DASH_SPOTLIGHT_MAX));
+  return rows.map((show) => indexCard(show, ""));
 }
 
 /** One show of a channel as a series card (shared by the channel rows + search). */
-async function showCard(slug, channel, label) {
-  let hubHtml = await fetchText(SITE + "/category/" + (channel ? channel + "/" : "") + slug + "/", 6 * 60 * 60 * 1000, SITE_REF);
-  if (!hubHtml && channel) hubHtml = await fetchText(SITE + "/category/" + slug + "/", 6 * 60 * 60 * 1000, SITE_REF);
-  const hub = hubHtml ? parseShowHub(hubHtml, slug) : { name: "", poster: "", channel: "" };
-  const ch = channel || hub.channel;
+/**
+ * One serial as a series card. Everything comes from the index, so a row of 32
+ * cards costs a single request; only a serial missing from the snapshot (brand
+ * new show) falls back to its hub page.
+ */
+async function showCard(slug, channel, label, origin) {
+  const index = (await dtsIndex(origin)).shows;
+  const show = index.get(slug);
+  return show ? indexCard(show, label) : hubCard(slug, channel, label);
+}
+
+/** One page of a catalog row built from show entries. */
+async function showRowCatalog(rows, skip, label, origin) {
+  const page = (rows || []).slice(skip, skip + PAGE_SIZE);
+  const index = (await dtsIndex(origin)).shows;
+  const cards = [];
+  for (const row of page) {
+    const show = index.get(row.slug);
+    cards.push(show ? indexCard(show, label) : await hubCard(row.slug, row.channel, label));
+  }
+  return cards;
+}
+
+/** Series card for a serial missing from the snapshot (fetches its hub page). */
+async function hubCard(slug, channel, label) {
+  const parsed = parseShowHub(await fetchShowHub(slug, channel), slug);
+  const ch = channel || parsed.channel || "";
+  const name = parsed.name || prettify(slug);
   const shownAs = label || channelLabel(ch) || "Desi Tashan";
-  const name = hub.name || prettify(slug);
   return {
     id: showId(slug, ch),
     type: "series",
     name,
-    poster: hub.poster || FALLBACK_POSTER,
+    poster: parsed.poster || FALLBACK_POSTER,
     posterShape: "landscape",
-    description: shownAs + " · " + name + " full episodes",
+    description: `${shownAs} · ${name} full episodes`,
     releaseInfo: shownAs,
   };
-}
-
-async function showRowCatalog(keys, skip, label) {
-  const page = keys.slice(skip, skip + PAGE_SIZE);
-  return Promise.all(page.map((k) => showCard(k.slug, k.channel, label)));
 }
 
 /** "Anupama 12th November 2026 Full Episode | Star Plus" -> "Anupama" */
@@ -885,175 +1087,163 @@ function dashShowSlug(name) {
 /** Shows of one "Watch by Channel" tile: sitemap membership first, then the show
  *  names the tile's own page lists (covers tiles the category sitemap never nests,
  *  e.g. Dangal TV or the Bigg Boss 20 hub). */
-async function dashTileShows(tileSlug) {
-  const keys = await seriesShowKeys();
-  const found = new Map();
-  for (const k of keys) if (k.channels.includes(tileSlug) || k.channel === tileSlug) found.set(k.slug, k);
-  const bySlug = new Map(keys.map((k) => [k.slug, k]));
-  const byName = new Map(keys.map((k) => [prettify(k.slug).toLowerCase(), k]));
-  const html = await fetchText(SITE + "/category/" + tileSlug + "/", 30 * 60 * 1000, SITE_REF);
+/**
+ * Serials carried by a channel. The snapshot knows every serial that ever aired
+ * on a channel; tiles that are really single shows (e.g. Bigg Boss 20) have no
+ * episodes of their own, so they fall back to the tile page.
+ */
+async function dashTileShows(tileSlug, origin) {
+  const index = (await dtsIndex(origin)).shows;
+  const found = channelIndexShows(index, tileSlug);
+  if (found.length) return found;
+  return legacyTileShows(tileSlug, index);
+}
+
+/** Tile page fallback: the shows its spotlight cards point at. */
+async function legacyTileShows(tileSlug, index) {
+  const out = new Map();
+  const html = await fetchText(`${SITE}/category/${tileSlug}/`, 30 * 60 * 1000, SITE_REF);
   for (const card of parseCards(html)) {
-    const name = dashShowName(card.title);
-    const slug = dashShowSlug(name);
+    const slug = matchShowSlug(card, index) || segShowSlug(card.slug);
     if (!slug) continue;
-    const short = slug.length <= 8 ? slug : "";
-    const key =
-      byName.get(prettify(slug).toLowerCase()) ||
-      bySlug.get(slug) ||
-      (short ? keys.find((k) => k.slug.startsWith(short)) : null) ||
-      keys.find((k) => k.slug.startsWith(slug) || (k.slug.length >= 8 && slug.startsWith(k.slug)));
-    if (key) {
-      if (!found.has(key.slug)) found.set(key.slug, key);
-      continue;
-    }
-    if (!found.has(slug)) found.set(slug, { slug, channel: "", channels: [] });
+    out.set(slug, index.get(slug) || { slug, channel: tileSlug, name: prettify(slug) });
   }
-  return [...found.values()].sort((a, b) => prettify(a.slug).localeCompare(prettify(b.slug)));
+  return [...out.values()];
 }
 
 /** "Watch by Channel" tile -> that channel's serials (shows), sorted by show name. */
-async function dashChannelCatalog(channelSlug, skip, search) {
-  const q = String(search || "").trim().toLowerCase();
+/** One dashboard channel tile: its serials as series cards. */
+async function dashChannelCatalog(channelSlug, skip, search, origin) {
   const tile = DASH_TILES.find((t) => t.slug === channelSlug);
-  let keys = await dashTileShows(channelSlug);
-  if (q) keys = keys.filter((k) => k.slug.includes(q) || prettify(k.slug).toLowerCase().includes(q));
-  return showRowCatalog(keys, skip, tile ? tile.name : "");
+  const label = tile ? tile.name : channelLabel(channelSlug) || prettify(channelSlug);
+  let rows = await dashTileShows(channelSlug, origin);
+  const q = String(search || "").trim().toLowerCase();
+  if (q) {
+    rows = rows.filter((row) => `${row.slug} ${row.name || ""}`.toLowerCase().includes(q));
+  }
+  return showRowCatalog(rows, skip, label, origin);
 }
 
 /** Search box -> serials across every channel of the dashboard. */
-async function dashSearchCatalog(search, skip) {
-  const q = String(search || "").trim().toLowerCase();
-  if (!q) return [];
-  const keys = (await seriesShowKeys()).filter(
-    (k) =>
-      k.slug.includes(q) ||
-      prettify(k.slug).toLowerCase().includes(q) ||
-      channelLabel(k.channel).toLowerCase().includes(q),
-  );
-  return showRowCatalog(keys, skip);
+/** Search every serial the site carries (name, slug or channel). */
+async function dashSearchCatalog(search, skip, origin) {
+  const index = (await dtsIndex(origin)).shows;
+  return showRowCatalog(searchIndexShows(index, search), skip, "", origin);
 }
 
+/**
+ * Rows of the /dss add-on. Series only — desitashan.su carries serials, there is
+ * no film section on the site, so nothing is tagged as a movie.
+ */
+const DSS_TILE_CHANNEL_SLUGS = DASH_TILES.map((tile) => tile.slug);
+const DSS_EXTRA_CHANNELS = CHANNELS.filter((c) => DSS_TILE_CHANNEL_SLUGS.indexOf(c.slug) < 0);
+
 export function dssManifest(origin) {
+  const catalogs = [
+    { type: "series", id: "dss:spotlight", name: "New Episode Spotlight" },
+    { type: "series", id: "dss:latest", name: "Latest Desi Tashan Episodes" },
+  ];
+  for (const tile of DASH_TILES) {
+    catalogs.push({ type: "series", id: "dss:ch:" + tile.slug, name: tile.name });
+  }
+  for (const channel of DSS_EXTRA_CHANNELS) {
+    catalogs.push({ type: "series", id: "dss:ch:" + channel.slug, name: channel.name });
+  }
+  catalogs.push({ type: "series", id: "dss:all", name: "All Serials (A–Z)" });
+  catalogs.push({
+    type: "series",
+    id: "dss:search",
+    name: "Serials · Search",
+    extra: [{ name: "search", isRequired: true }],
+  });
   return {
     id: "org.pvrplay.desitashan.series",
     version: SERIES_VERSION,
-    name: "Desi Serials",
+    name: "Desi Tashan — Serials",
     description:
-      "Catalogs cloned from the desitashan.su dashboard: New Episode Spotlight, Latest Desi Tashan Episodes and one row per Watch-by-Channel tile.",
+      "Every serial on desitashan.su: 200+ shows, complete episode lists, newest first, no ads. " +
+      "All rows are series — the source has no films.",
     resources: ["catalog", "meta", "stream"],
     types: ["series", "movie"],
     idPrefixes: ["dts:"],
-    catalogs: [
-      {
-        type: "movie",
-        id: "dss:spotlight",
-        name: "New Episode Spotlight",
-        extra: [{ name: "skip", isRequired: false }],
-      },
-      {
-        type: "movie",
-        id: "dss:latest",
-        name: "Latest Desi Tashan Episodes",
-        extra: [{ name: "skip", isRequired: false }],
-      },
-      ...DASH_TILES.map((tile) => ({
-        type: "series",
-        id: "dss:ch:" + tile.slug,
-        name: tile.name,
-        extra: [
-          { name: "search", isRequired: false },
-          { name: "skip", isRequired: false },
-        ],
-      })),
-      {
-        type: "series",
-        id: "dss:search",
-        name: "Shows · Search",
-        extra: [
-          { name: "search", isRequired: true },
-          { name: "skip", isRequired: false },
-        ],
-      },
-    ],
-    behaviorHints: { configurable: false },
+    catalogs: catalogs,
   };
 }
 
 
+/** Rows of the /dts add-on — serials every step of the way, no movie rows. */
 export function dtsManifest(origin) {
-  const catalogs = [
-    { type: "movie", id: "dts:latest", name: "Desi Tashan — Latest", extra: [{ name: "skip", isRequired: false }] },
-  ];
-  for (const ch of CHANNELS) {
-    catalogs.push({
-      type: "movie",
-      id: "dts:ch:" + ch.slug,
-      name: "Desi Tashan — " + ch.name,
-      extra: [{ name: "skip", isRequired: false }],
-    });
+  const catalogs = [{ type: "series", id: "dts:latest", name: "Latest Serials" }];
+  for (const channel of CHANNELS) {
+    catalogs.push({ type: "series", id: "dts:ch:" + channel.slug, name: channel.name });
   }
+  catalogs.push({ type: "series", id: "dts:shows", name: "All Serials (A–Z)" });
   catalogs.push({
     type: "series",
-    id: "dts:shows",
-    name: "Desi Tashan — Shows",
-    extra: [{ name: "skip", isRequired: false }, { name: "search", isRequired: false }],
-  });
-  catalogs.push({
-    type: "search",
     id: "dts:search",
-    name: "Desi Tashan — Search",
-    extra: [{ name: "search", isRequired: true }, { name: "skip", isRequired: false }],
+    name: "Serials · Search",
+    extra: [{ name: "search", isRequired: true }],
   });
-
   return {
     id: "org.pvrplay.desitashan",
     version: ADDON_VERSION,
     name: "Desi Tashan",
     description:
-      "Latest Desi serial episodes from desitashan.su — Anupama, Vasudha, Pushpa Impossible, Dilon Ki Ram Leela and more. Direct MP4, no ads.",
+      "Serial episodes from desitashan.su — 200+ shows with their full episode lists, newest first, no ads.",
     resources: ["catalog", "meta", "stream"],
-    types: ["movie", "series"],
+    types: ["series", "movie"],
     idPrefixes: ["dts:"],
-    catalogs: catalogs.map((c) => (c.type === "search" ? Object.assign({}, c, { type: "movie" }) : c)),
-    behaviorHints: { configurable: false },
+    catalogs: catalogs,
   };
 }
 
-async function handleCatalog(type, id, url, variant = "dts") {
+async function handleCatalog(type, id, url, variant = "dts", origin = "") {
   const skip = Math.max(0, Number(url.searchParams.get("skip")) || 0);
   const search = (url.searchParams.get("search") || "").trim();
   let metas = [];
-
   try {
-    if (variant === "dss") {
-      if (id === "dss:spotlight") metas = await dashSpotlightCatalog();
-      else if (id === "dss:latest") metas = await dashLatestCatalog(skip);
-      else if (id.startsWith("dss:ch:")) metas = await dashChannelCatalog(id.slice("dss:ch:".length), skip, search);
-      else if (id.startsWith("dss:search")) metas = await dashSearchCatalog(search, skip);
-      // kept as hidden fallbacks for installs saved before the dashboard clone
-      else if (id === "dss:by-channel") metas = await showsByChannelCatalog(skip);
-      else if (id === "dss:updates") metas = await updatesCatalog(skip);
-    } else if (id === "dts:latest") metas = await latestCatalog(skip);
-    else if (id.startsWith("dts:ch:")) metas = await channelCatalog(id.slice(7), skip);
-    else if (id === "dts:shows") metas = await showsCatalog(skip);
-    else if (id.startsWith("dts:search")) metas = await searchCatalog(search, skip);
+    metas = await catalogCards(id, { search, skip, variant, origin });
   } catch {
     metas = [];
   }
-
   // remember slug<->pid so a bare-id stream request can still be served
   for (const m of metas) {
     const e = String(m.id).match(/^dts:ep:(.+)_([a-f0-9]{16})$/);
     if (e) memSet("pid:" + e[2], e[1], 6 * 60 * 60 * 1000);
   }
-
   const noCache = id.includes("search");
   return json({ metas }, noCache ? 60 : 600);
 }
 
-async function handleMeta(type, id) {
+/**
+ * Catalog id -> cards. Every row is a SERIES row: desitashan.su only carries
+ * serials (per-episode posts of TV serials, including its Netflix/Hotstar/MX
+ * Player sections) and has no films at all, so nothing is tagged as a movie.
+ */
+async function catalogCards(id, { search, skip, variant, origin }) {
+  const key = String(id).replace(/^dss:/, "").replace(/^dts:/, "");
+  const isDss = String(id).startsWith("dss:");
+  if (key === "spotlight") return dashSpotlightCatalog(origin);
+  if (key === "latest" || key === "updates") {
+    return isDss ? dashLatestCatalog(skip, origin) : latestCatalog(skip, origin);
+  }
+  if (key === "all" || key === "shows") return showsCatalog(skip, origin);
+  if (key === "by-channel") return showsByChannelCatalog(skip, origin);
+  if (key === "search") {
+    return isDss ? dashSearchCatalog(search, skip, origin) : searchCatalog(search, skip, origin);
+  }
+  if (key.startsWith("ch:")) {
+    const channel = key.slice(3);
+    return isDss
+      ? dashChannelCatalog(channel, skip, search, origin)
+      : channelCatalog(channel, skip, origin);
+  }
+  return [];
+}
+
+async function handleMeta(type, id, origin) {
   try {
-    const meta = id.startsWith("dts:show:") ? await showMeta(id) : await episodeMeta(id);
+    const meta = String(id).startsWith("dts:show:") ? await showMeta(id, origin) : await episodeMeta(id);
     if (meta) return json({ meta }, 600);
   } catch {
     /* fall through */
@@ -1064,7 +1254,7 @@ async function handleMeta(type, id) {
 async function handleStream(type, id, origin) {
   let streams = [];
   try {
-    const path = await pathForStreamId(id);
+    const path = await pathForStreamId(id, origin);
     if (path) {
       const hit = await episodeToken(path);
       const page = hit ? hit.page : null;
@@ -1126,24 +1316,24 @@ export async function handleDesiSeries(request, url, origin) {
 
 async function routeAddon(url, origin, mount, variant) {
   const path = url.pathname;
-  if (path !== mount && !path.startsWith(mount + "/")) return null;
+  if (path !== mount && path.indexOf(mount + "/") !== 0) return null;
+  const rest = path.slice(mount.length) || "/";
 
-  if (path === mount || path === mount + "/" || path === mount + "/manifest.json") {
+  if (rest === "/" || rest === "/manifest.json") {
     return json(variant === "dss" ? dssManifest(origin) : dtsManifest(origin), 600);
   }
-  if (path === mount + "/p") return handleRelay(url);
+  if (rest === "/p") return handleRelay(url);
 
-  let m;
-  if ((m = path.match(new RegExp("^" + mount + "/catalog/([^/]+)/(.+)\\.json$")))) {
-    return handleCatalog(m[1], decodeURIComponent(m[2]), url, variant);
-  }
-  if ((m = path.match(new RegExp("^" + mount + "/meta/([^/]+)/(.+)\\.json$")))) {
-    return handleMeta(m[1], decodeURIComponent(m[2]));
-  }
-  if ((m = path.match(new RegExp("^" + mount + "/stream/([^/]+)/(.+)\\.json$")))) {
-    return handleStream(m[1], decodeURIComponent(m[2]), origin);
-  }
-  return json({ err: "not found" }, 60, 404);
+  let m = rest.match(/^\/catalog\/([^/]+)\/(.+)\.json$/);
+  if (m) return handleCatalog(m[1], decodeURIComponent(m[2]), url, variant, origin);
+
+  m = rest.match(/^\/meta\/([^/]+)\/(.+)\.json$/);
+  if (m) return handleMeta(m[1], decodeURIComponent(m[2]), origin);
+
+  m = rest.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
+  if (m) return handleStream(m[1], decodeURIComponent(m[2]), origin);
+
+  return null;
 }
 
 export const _test = {
@@ -1171,6 +1361,17 @@ export const _test = {
   dashShowName,
   dashShowSlug,
   seriesShowKeys,
+  indexFromShows,
+  indexEntry,
+  indexCard,
+  segInfo,
+  segShowSlug,
+  prettyDate,
+  channelIndexShows,
+  searchIndexShows,
+  matchShowSlug,
+  parseEpisodesPayload,
+  byNewest,
   dashSpotlightCatalog,
   dashLatestCatalog,
   dashChannelCatalog,
