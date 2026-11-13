@@ -1317,10 +1317,39 @@ export async function handleDesiSeries(request, url, origin) {
   return routeAddon(url, origin, "/dss", "dss");
 }
 
+function applyPathExtras(url, path) {
+  const segs = path.split('/');
+  const kept = [];
+  let found = false;
+  const take = (pair) => {
+    const eq = pair.indexOf('=');
+    const key = eq > 0 ? pair.slice(0, eq) : '';
+    if (!key || !/^[a-z][a-z0-9]*$/i.test(key)) return false;
+    let val = pair.slice(eq + 1).replace(/\.json$/i, '');
+    try { val = decodeURIComponent(val); } catch (e) { /* keep raw */ }
+    if (!url.searchParams.has(key)) url.searchParams.set(key, val);
+    found = true;
+    return true;
+  };
+  for (const seg of segs) {
+    // Legacy Stremio extra forms: /catalog/series/x/search=foo.json
+    // and /catalog/series/x/genre=Action&skip=100.json
+    if (/^[a-z][a-z0-9]*=/i.test(seg) && seg.split('&').every((p) => /^[a-z][a-z0-9]*=/i.test(p))) {
+      seg.split('&').forEach(take);
+      continue;
+    }
+    kept.push(seg);
+  }
+  if (!found) return path;
+  let out = kept.join('/');
+  if (/\.json$/.test(path) && !/\.json$/.test(out)) out += '.json';
+  return out;
+}
+
 async function routeAddon(url, origin, mount, variant) {
   const path = url.pathname;
   if (path !== mount && path.indexOf(mount + "/") !== 0) return null;
-  const rest = path.slice(mount.length) || "/";
+  const rest = applyPathExtras(url, path.slice(mount.length) || "/");
 
   if (rest === "/" || rest === "/manifest.json") {
     return json(variant === "dss" ? dssManifest(origin) : dtsManifest(origin), 600);

@@ -739,7 +739,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.6.9",
+    version: "1.7.0",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -1008,6 +1008,35 @@ async function resolveStreams(type, rawId) {
   return out;
 }
 
+function applyPathExtras(url, path) {
+  const segs = path.split('/');
+  const kept = [];
+  let found = false;
+  const take = (pair) => {
+    const eq = pair.indexOf('=');
+    const key = eq > 0 ? pair.slice(0, eq) : '';
+    if (!key || !/^[a-z][a-z0-9]*$/i.test(key)) return false;
+    let val = pair.slice(eq + 1).replace(/\.json$/i, '');
+    try { val = decodeURIComponent(val); } catch (e) { /* keep raw */ }
+    if (!url.searchParams.has(key)) url.searchParams.set(key, val);
+    found = true;
+    return true;
+  };
+  for (const seg of segs) {
+    // Legacy Stremio extra forms: /catalog/series/x/search=foo.json
+    // and /catalog/series/x/genre=Action&skip=100.json
+    if (/^[a-z][a-z0-9]*=/i.test(seg) && seg.split('&').every((p) => /^[a-z][a-z0-9]*=/i.test(p))) {
+      seg.split('&').forEach(take);
+      continue;
+    }
+    kept.push(seg);
+  }
+  if (!found) return path;
+  let out = kept.join('/');
+  if (/\.json$/.test(path) && !/\.json$/.test(out)) out += '.json';
+  return out;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -1039,7 +1068,7 @@ export default {
 
       // Stremio stream endpoint. The id may be tt123, tmdb:123 or a bare
       // number; for series Stremio appends :season:episode.
-      const str = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
+      const str = applyPathExtras(url, path).match(/^\/stream\/([^/]+)\/(.+)\.json$/);
       if (str) {
         const streams = await resolveStreams(str[1], decodeURIComponent(str[2]));
         // Signed URLs expire, so cache only briefly; never cache an empty answer.
@@ -1048,7 +1077,7 @@ export default {
         return resp;
       }
       // /meta/<type>/<id>.json
-      const mm = path.match(/^\/meta\/([^/]+)\/(.+?)\.json$/);
+      const mm = applyPathExtras(url, path).match(/^\/meta\/([^/]+)\/(.+?)\.json$/);
       if (mm) {
         const data = await meta(decodeURIComponent(mm[1]), decodeURIComponent(mm[2]));
         // 404 rather than {"meta":null}: Nuvio stops at the first addon that
@@ -1095,8 +1124,9 @@ export default {
         const type = decodeURIComponent(m[1]);
         const id = decodeURIComponent(m[2]);
         const extra = {};
+        for (const [k, v] of url.searchParams) extra[k] = v;
         if (m[3]) {
-          for (const part of m[3].split("&")) {
+          for (const part of m[3].split(/[/&]/)) {
             const eq = part.indexOf("=");
             if (eq > 0) {
               extra[decodeURIComponent(part.slice(0, eq))] = decodeURIComponent(part.slice(eq + 1));

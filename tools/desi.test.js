@@ -63,3 +63,64 @@ test("JuicyCodes packing is expanded", () => {
   const out = _test.textVariants(html);
   assert.ok(out.length > 1, "decoded variant expected");
 });
+
+test("titles from the show index have HTML entities decoded", () => {
+  assert.equal(_test.unescapeHtml("Awards &amp; Concerts"), "Awards & Concerts");
+  assert.equal(_test.unescapeHtml("&#039;90s &#x26; more"), "'90s & more");
+});
+
+test("legacy Stremio path extras are merged into query params", () => {
+  const u = new URL("https://x/desi/catalog/series/search/search=naagin.json");
+  assert.equal(_test.applyPathExtras(u, u.pathname), "/desi/catalog/series/search.json");
+  assert.equal(u.searchParams.get("search"), "naagin");
+  const v = new URL("https://x/desi/catalog/series/star-plus/skip=30.json");
+  assert.equal(_test.applyPathExtras(v, v.pathname), "/desi/catalog/series/star-plus.json");
+  assert.equal(v.searchParams.get("skip"), "30");
+});
+
+test("ampersand-joined legacy extras are handled too", () => {
+  const u = new URL("https://x/desi/catalog/series/search/genre=Action&skip=100.json");
+  const out = _test.applyPathExtras(u, u.pathname);
+  assert.equal(out, "/desi/catalog/series/search.json");
+  assert.equal(u.searchParams.get("skip"), "100");
+  assert.equal(u.searchParams.get("genre"), "Action");
+});
+
+test("plain catalog paths are left untouched", () => {
+  const u = new URL("https://x/desi/catalog/series/star-plus.json");
+  assert.equal(_test.applyPathExtras(u, u.pathname), "/desi/catalog/series/star-plus.json");
+  assert.equal([...u.searchParams].length, 0);
+});
+
+const IDX_FIXTURE = {
+  shows: {
+    "star-plus~anupamaa": ["star-plus", "", "Anupamaa", "https://p/1.jpg", "2026-11-12", 500],
+    "star-plus~kumkum-bhagya": ["star-plus", "star-plus-completed-shows", "Kumkum Bhagya", null, "2021-03-05", 100],
+    "colors~colors-completed-shows~naagin-4-colors": ["colors", "colors-completed-shows", "Naagin 4", null, "2020-05-23", 90],
+    "life-ok~bade-achhe-lagte-hain": ["life-ok", "", "Bade Achhe Lagte Hain", null, "2019-01-01", 50],
+  },
+};
+function stubIndex(body = IDX_FIXTURE, ok = true) {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok, json: async () => body });
+  return () => { globalThis.fetch = orig; };
+}
+
+test("channel rows list every show of the channel, newest first", async () => {
+  const restore = stubIndex();
+  try {
+    const out = await _test.catalogFromIndex("star-plus", new URL("https://x/desi/catalog/series/star-plus.json"), "https://x");
+    assert.ok(out, "index should be used");
+    assert.deepEqual(out.metas.map((m) => m.name), ["Anupamaa", "Kumkum Bhagya"]);
+    assert.equal(out.metas[0].id, "dser:ser:star-plus~anupamaa");
+    assert.equal(out.metas[1].type, "series");
+  } finally { restore(); }
+});
+
+test("archive channels get no catalog row", async () => {
+  const restore = stubIndex();
+  try {
+    assert.equal(await _test.catalogFromIndex("life-ok", new URL("https://x/desi/catalog/series/life-ok.json"), "https://x"), null);
+    assert.deepEqual(_test.ARCHIVE_CHANNELS, ["life-ok", "zoo-of-all-old-shows"]);
+  } finally { restore(); }
+});

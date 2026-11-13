@@ -26,14 +26,21 @@ const PLAYER_REF = 'https://tvarticles.org/';
 const PREFIX = 'dser';
 
 const CHANNELS = [
-  { id: 'star-plus', name: 'Star Plus', path: '/star-plus-hdepisodes/' },
-  { id: 'zee-tv', name: 'Zee TV', path: '/zee-tv/' },
-  { id: 'sony-tv', name: 'Sony TV', path: '/sony-tv/' },
-  { id: 'color-tv', name: 'Colors TV', path: '/color-tv-hd/' },
-  { id: 'star-bharat', name: 'Star Bharat', path: '/star-bharat/' },
-  { id: 'sab-tv', name: 'Sab TV', path: '/sab-tv-hd/' },
-  { id: 'and-tv', name: '& TV', path: '/and-tv/' },
+  { id: 'star-plus', name: 'Star Plus', path: '/star-plus-hdepisodes/', slug: 'star-plus' },
+  { id: 'zee-tv', name: 'Zee TV', path: '/zee-tv/', slug: 'zee-tv' },
+  { id: 'sony-tv', name: 'Sony TV', path: '/sony-tv/', slug: 'sony-tv' },
+  { id: 'color-tv', name: 'Colors TV', path: '/color-tv-hd/', slug: 'colors' },
+  { id: 'star-bharat', name: 'Star Bharat', path: '/star-bharat/', slug: 'star-bharat' },
+  { id: 'sab-tv', name: 'Sab TV', path: '/sab-tv-hd/', slug: 'sab-tv' },
+  { id: 'and-tv', name: '& TV', path: '/and-tv/', slug: 'and-tv' },
 ];
+
+/** Retired/archive channels: no catalog row of their own, but their shows stay
+ *  reachable through search. */
+const ARCHIVE_CHANNELS = ['life-ok', 'zoo-of-all-old-shows'];
+/** Show index built offline by tools/build-desi-index.mjs, served from /desi-data/. */
+const DATA_FILE = '/desi-data/shows.json';
+const PAGE = 30;
 
 /* ------------------------------------------------------------------ utils */
 
@@ -273,17 +280,25 @@ function uaFromToken(url) {
 export function desiManifest(origin) {
   const catalogs = [
     { type: 'movie', id: 'latest', name: 'Desi Serials — Latest Episodes' },
-    ...CHANNELS.map((c) => ({ type: 'series', id: c.id, name: `Desi Serials — ${c.name}` })),
+    ...CHANNELS.map((c) => ({
+      type: 'series',
+      id: c.id,
+      name: `Desi Serials — ${c.name}`,
+      extra: [{ name: 'skip', isRequired: false }],
+    })),
     {
       type: 'series',
       id: 'search',
       name: 'Desi Serials — Search',
-      extra: [{ name: 'search', isRequired: true }],
+      extra: [
+        { name: 'search', isRequired: true },
+        { name: 'skip', isRequired: false },
+      ],
     },
   ];
   return {
     id: 'org.ongserv.desiserials',
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'Desi Serials',
     description:
       'Indian TV serials and daily episodes from desi-serials.to — Star Plus, Zee TV, Sony TV, Colors, Star Bharat, Sab TV and & TV.',
@@ -374,7 +389,147 @@ function normalize(s) {
     .trim();
 }
 
-async function handleCatalog(type, id, url) {
+function unescapeHtml(s) {
+  const codePoint = (n) => (Number.isFinite(n) && n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '');
+  return String(s || '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => codePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => codePoint(parseInt(d, 10)))
+    .replace(/&amp;/g, '&').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Stremio clients may pass catalog extras in the path instead of the query
+ *  string: /catalog/series/<id>/search=naagin/skip=30.json
+ *  Fold those segments into url.searchParams and hand back a clean path. */
+function applyPathExtras(url, path) {
+  const segs = path.split('/');
+  const kept = [];
+  let found = false;
+  const take = (pair) => {
+    const eq = pair.indexOf('=');
+    const key = eq > 0 ? pair.slice(0, eq) : '';
+    if (!key || !/^[a-z][a-z0-9]*$/i.test(key)) return false;
+    let val = pair.slice(eq + 1).replace(/\.json$/i, '');
+    try { val = decodeURIComponent(val); } catch (e) { /* keep raw */ }
+    if (!url.searchParams.has(key)) url.searchParams.set(key, val);
+    found = true;
+    return true;
+  };
+  for (const seg of segs) {
+    // Legacy Stremio extra forms: /catalog/series/x/search=foo.json
+    // and /catalog/series/x/genre=Action&skip=100.json
+    if (/^[a-z][a-z0-9]*=/i.test(seg) && seg.split('&').every((p) => /^[a-z][a-z0-9]*=/i.test(p))) {
+      seg.split('&').forEach(take);
+      continue;
+    }
+    kept.push(seg);
+  }
+  if (!found) return path;
+  let out = kept.join('/');
+  if (/\.json$/.test(path) && !/\.json$/.test(out)) out += '.json';
+  return out;
+}
+
+/** Full show index (every show the site publishes, incl. archive channels),
+ *  built offline by tools/build-desi-index.mjs and served as a static asset
+ *  from this addon's own origin. Returns null when unavailable. */
+async function showIndex(origin) {
+  if (!origin) origin = RUNTIME_ORIGIN;
+  const cached = memGet('desi-index', 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+  if (!origin) return null;
+  try {
+    const res = await fetch(`${origin}${DATA_FILE}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const rows = Object.keys(data.shows || {}).map((key) => {
+      const v = data.shows[key] || [];
+      return {
+        key,
+        channel: v[0] || '',
+        group: v[1] || '',
+        title: unescapeHtml(v[2]) || key.split('~').pop().replace(/-/g, ' '),
+        poster: v[3] || '',
+        latestIso: v[4] || '',
+        latestId: v[5] || 0,
+      };
+    });
+    if (!rows.length) return null;
+    memSet('desi-index', rows, 6 * 60 * 60 * 1000);
+    return rows;
+  } catch (e) {
+    return null;
+  }
+}
+
+function channelLabel(slug) {
+  const hit = CHANNELS.find((c) => c.slug === slug || c.id === slug);
+  if (hit) return hit.name;
+  return slug.split('-').map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
+}
+
+function byRecent(a, b) {
+  const da = a.latestIso || '';
+  const db = b.latestIso || '';
+  if (da && db && da !== db) return da < db ? 1 : -1;
+  if (da !== db) return da ? -1 : 1;
+  return a.title.localeCompare(b.title);
+}
+
+function rowToCard(row) {
+  const group = row.group && !/completed-shows$/.test(row.group) ? row.group : '';
+  return {
+    id: `${PREFIX}:ser:${row.key}`,
+    type: 'series',
+    name: row.title,
+    poster: row.poster || '',
+    posterShape: 'landscape',
+    description: `${channelLabel(row.channel)}${group ? ` · ${group.replace(/-/g, ' ')}` : ''}`,
+    releaseInfo: channelLabel(row.channel),
+  };
+}
+
+function searchRows(rows, query) {
+  const q = normalize(query);
+  if (!q) return [];
+  const terms = q.split(' ').filter(Boolean);
+  const hits = [];
+  for (const row of rows) {
+    const hay = normalize(`${row.title} ${row.key}`);
+    if (!terms.every((t) => hay.indexOf(t) >= 0)) continue;
+    const name = normalize(row.title);
+    let score = 0;
+    if (name === q) score = 100;
+    else if (name.indexOf(q) === 0) score = 60;
+    else if (terms.every((t) => name.split(' ').some((w) => w.indexOf(t) === 0))) score = 40;
+    else if (name.indexOf(q) >= 0) score = 20;
+    hits.push({ row, score });
+  }
+  hits.sort((a, b) => b.score - a.score || byRecent(a.row, b.row));
+  return hits.map((h) => rowToCard(h.row));
+}
+
+/** Cards for a channel row / the search row, from the bulk index. */
+async function catalogFromIndex(id, url, origin) {
+  const rows = await showIndex(origin);
+  if (!rows) return null;
+  const skip = Math.max(0, parseInt(url.searchParams.get('skip') || '0', 10) || 0);
+  if (id === 'search') {
+    const q = (url.searchParams.get('search') || '').trim();
+    const cards = q
+      ? searchRows(rows, q)
+      : rows.slice().sort(byRecent).map(rowToCard);
+    return { metas: cards.slice(skip, skip + PAGE) };
+  }
+  const ch = CHANNELS.find((c) => c.id === id);
+  if (!ch) return null;
+  const cards = rows.filter((r) => r.channel === ch.slug).sort(byRecent).map(rowToCard);
+  if (!cards.length) return null;
+  return { metas: cards.slice(skip, skip + PAGE) };
+}
+
+async function handleCatalog(type, id, url, origin) {
   const search = (url.searchParams.get('search') || '').trim();
   const skip = parseInt(url.searchParams.get('skip') || '0', 10) || 0;
 
@@ -384,6 +539,8 @@ async function handleCatalog(type, id, url) {
   }
 
   if (id === 'search') {
+    const fromIndex = await catalogFromIndex(id, url, origin);
+    if (fromIndex) return json(fromIndex, 300);
     if (!search) return json({ metas: [] }, 60);
     const q = normalize(search);
     const index = await seriesIndex();
@@ -395,6 +552,8 @@ async function handleCatalog(type, id, url) {
 
   const channel = CHANNELS.find((c) => c.id === id);
   if (!channel) return json({ metas: [] }, 60);
+  const fromIndex = await catalogFromIndex(id, url, origin);
+  if (fromIndex) return json(fromIndex, 3600);
   const html = await fetchHtml(SITE + channel.path, 60 * 60 * 1000);
   const metas = parseSeriesCards(html, channel.id).map((s) => ({
     id: s.id,
@@ -473,7 +632,9 @@ async function handleMeta(type, id) {
 
   const path = seriesPathFromId(id);
   const name = path.split('/').pop().replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-  const pages = [1, 2, 3];
+  // The site paginates a show's episodes 15/page (newest first) and deep archives can run into
+  // hundreds of pages, so list a generous window rather than only the newest page.
+  const pages = [1, 2, 3, 4, 5, 6, 7, 8];
   const htmls = await Promise.all(
     pages.map((p) =>
       fetchHtml(`${SITE}/watch-online/${path}/${p > 1 ? `page/${p}/` : ''}`, 30 * 60 * 1000).catch(() => '')
@@ -681,7 +842,10 @@ ul{padding-left:18px;color:#c8ccda}
  * @param {URL} url
  * @param {string} origin e.g. https://pvrplay-catalogs.pages.dev
  */
+let RUNTIME_ORIGIN = '';
+
 export async function handleDesi(request, url, origin) {
+  if (origin) RUNTIME_ORIGIN = origin;
   const cors = {
     'access-control-allow-origin': '*',
     'access-control-allow-headers': '*',
@@ -721,11 +885,11 @@ export async function handleDesi(request, url, origin) {
       return proxyPlaylist(target, origin);
     }
 
-    const m = path.match(/^\/(catalog|meta|stream)\/(movie|series)\/(.+)\.json$/);
+    const m = applyPathExtras(url, path).match(/^\/(catalog|meta|stream)\/(movie|series)\/(.+)\.json$/);
     if (m) {
       const [, kind, type, rawId] = m;
       const id = decodeURIComponent(rawId);
-      if (kind === 'catalog') return handleCatalog(type, id, url);
+      if (kind === 'catalog') return handleCatalog(type, id, url, origin);
       if (kind === 'meta') return handleMeta(type, id);
       return handleStream(type, id, origin);
     }
@@ -741,4 +905,5 @@ export async function handleDesi(request, url, origin) {
 export const _test = {
   parseSeriesCards, parseEpisodes, parseEpisodePage, extractM3u8, extractEmbed,
   textVariants, titleDate, dayOfYear, uaFromToken, b64urlEncode, b64urlDecode,
+  applyPathExtras, unescapeHtml, searchRows, catalogFromIndex, ARCHIVE_CHANNELS,
 };
