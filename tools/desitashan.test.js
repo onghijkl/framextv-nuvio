@@ -193,3 +193,32 @@ test("iso dates come from the snapshot instead of being re-derived from the slug
   assert.equal(rows[0].iso, "2026-01-03");
   assert.equal(_test.segInfo(rows[0].seg, "mystery-show").iso, "2026-01-03");
 });
+
+test("a bare search row falls back to the A-Z list instead of nothing", async () => {
+  // the only fetches the index needs are the snapshot assets, served from disk
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    const p = String(u).replace("https://example.test", "");
+    if (p.startsWith("/dss-data/")) {
+      const body = readFileSync(new URL("./../addon" + p, import.meta.url), "utf8");
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }
+    return new Response("nope", { status: 404 });
+  };
+  try {
+    const rows = await _test.catalogCards("dss:search", { origin: "https://example.test", skip: 0 });
+    assert.ok(rows.length > 0, "empty search should still list shows");
+    for (const r of rows) {
+      assert.ok(r.id, "card needs an id");
+      assert.ok(String(r.id).startsWith("dts:show:") || String(r.id).startsWith("dss:"), r.id);
+    }
+    const named = await _test.catalogCards("dss:search", {
+      origin: "https://example.test",
+      skip: 0,
+      search: "naagin",
+    });
+    assert.ok(named.length > 0 && named.length <= rows.length, "query should narrow the list");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

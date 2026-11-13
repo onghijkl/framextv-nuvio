@@ -33,10 +33,10 @@ const SITE_REF = "https://www.desitashan.su/";
 const FREEZOD_PLAY = "https://freezod.com/hls-synapsixto/";
 const FREEZOD_META = "https://freezod.com/hls-synapsixto/media_meta.php";
 
-const ADDON_VERSION = "1.2.0";
+const ADDON_VERSION = "1.2.1";
 // The series-only add-on (/dss) is versioned independently from the add-on
 // that carries channels + search (/dts).
-const SERIES_VERSION = "1.2.0";
+const SERIES_VERSION = "1.2.1";
 
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 " +
@@ -1230,6 +1230,9 @@ async function catalogCards(id, { search, skip, variant, origin }) {
   if (key === "all" || key === "shows") return showsCatalog(skip, origin);
   if (key === "by-channel") return showsByChannelCatalog(skip, origin);
   if (key === "search") {
+    // `search` is declared required, but a bare hit on the row should still show
+    // something rather than an empty screen.
+    if (!search) return showsCatalog(skip, origin);
     return isDss ? dashSearchCatalog(search, skip, origin) : searchCatalog(search, skip, origin);
   }
   if (key.startsWith("ch:")) {
@@ -1372,6 +1375,7 @@ export const _test = {
   matchShowSlug,
   parseEpisodesPayload,
   byNewest,
+  catalogCards,
   dashSpotlightCatalog,
   dashLatestCatalog,
   dashChannelCatalog,
