@@ -939,7 +939,9 @@ export async function handleDesi(request, url, origin) {
     if (m) {
       const [, kind, type, rawId] = m;
       const id = decodeURIComponent(rawId);
-      if (kind === 'catalog') return handleCatalog(type, id, url, origin);
+      // The main pvrplay manifest also advertises these rows, prefixed so they
+      // cannot collide with its own catalog ids (desi:star-plus → star-plus).
+      if (kind === 'catalog') return handleCatalog(type, id.replace(/^desi:/, ''), url, origin);
       if (kind === 'meta') return handleMeta(type, id);
       return handleStream(type, id, origin);
     }

@@ -3,7 +3,7 @@
 import "../providers/framextv.js";
 import "../providers/pvrplay.js";
 import "../providers/vidlink.js";
-import { handleDesi } from "./desi.js";
+import { handleDesi, desiManifest } from "./desi.js";
 import { handleDesiTashan, handleDesiSeries } from "./desitashan.js";
 
 /**
@@ -737,9 +737,21 @@ function manifest() {
       catalogs.push(entry);
     }
   }
+
+  // Desi Serials rows, also advertised here so one addon install covers them
+  // (Android Nuvio has no separate plugin slot). Mounted at /desi, ids carry
+  // a `desi:` prefix; cards resolve to `dser:` meta/stream ids.
+  for (const c of desiManifest(PVR_BASE + "/desi").catalogs) {
+    catalogs.push({
+      type: c.type,
+      id: "desi:" + c.id,
+      name: "Desi · " + c.name,
+      extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
+    });
+  }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.7.2",
+    version: "1.7.3",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -750,10 +762,10 @@ function manifest() {
       // No idPrefixes here on purpose. Nuvio rewrites a tmdb: id to an IMDb
       // id before resolving meta, then filters addons by idPrefixes — so
       // declaring "tmdb:" means this resource is never consulted.
-      { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:"] }
+      { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "dser:"] }
     ],
     types: ["movie", "series"],
-    idPrefixes: ["tmdb:"],
+    idPrefixes: ["tmdb:", "dser:"],
     catalogs: catalogs
   };
 }
@@ -1050,6 +1062,16 @@ export default {
       // Desi Serials — a self-contained catalog addon mounted under /desi.
       if (path === "/desi" || path.startsWith("/desi/")) {
         return handleDesi(request, url, `${url.protocol}//${url.host}`);
+      }
+
+      // The same Desi rows are advertised by THIS manifest with a `desi:` /
+      // `dser:` id prefix, so a client that only lets you install one addon
+      // (Android Nuvio) still gets them. Rewrite the path onto the /desi mount
+      // and let that module's own router answer.
+      if (/^\/(catalog|meta|stream)\/(movie|series)\/(desi:|dser:)/.test(decodeURIComponent(path))) {
+        const u2 = new URL(url.toString());
+        u2.pathname = "/desi" + path;
+        return handleDesi(request, u2, `${url.protocol}//${url.host}`);
       }
 
       // Desi Tashan — second self-contained catalog addon, mounted under /dts.
