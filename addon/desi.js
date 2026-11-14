@@ -259,6 +259,13 @@ function extractEmbed(html) {
       || v.match(/["'](?:https?:)?\/\/([a-z0-9-]+\.tvlogy\.to)\/(plyr0?1|nflix|embed0?1)\/([A-Za-z0-9_-]+)/i);
     if (m) return m[0].startsWith('http') ? m[0] : `https://${m[1]}/${m[2]}/${m[3]}`;
   }
+  // Older uploads use a different player endpoint: hls.tvlogy.to/player/index.php?data=<hex>
+  // Missing this pattern made every legacy episode resolve to zero streams.
+  for (const v of textVariants(html)) {
+    const m = v.match(/https?:\/\/[a-z0-9.-]*tvlogy\.to\/player\/index\.php\?data=[a-f0-9]{8,}/i)
+      || v.match(/["'](?:https?:)?\/\/([a-z0-9-]+\.tvlogy\.to)\/(player\/index\.php\?data=[a-f0-9]+)/i);
+    if (m) return m[0].startsWith('http') ? m[0] : `https://${m[1]}/${m[2]}`;
+  }
   return null;
 }
 
@@ -298,7 +305,7 @@ export function desiManifest(origin) {
   ];
   return {
     id: 'org.ongserv.desiserials',
-    version: '1.1.0',
+    version: '1.2.0',
     name: 'Desi Serials',
     description:
       'Indian TV serials and daily episodes from desi-serials.to — Star Plus, Zee TV, Sony TV, Colors, Star Bharat, Sab TV and & TV.',
@@ -453,6 +460,9 @@ async function showIndex(origin) {
         poster: v[3] || '',
         latestIso: v[4] || '',
         latestId: v[5] || 0,
+        // 1 = newest episode verified playable, 0 = every server is dead at the
+        // host (old uploads get deleted), undefined = never probed.
+        playable: v[6],
       };
     });
     if (!rows.length) return null;
@@ -479,13 +489,15 @@ function byRecent(a, b) {
 
 function rowToCard(row) {
   const group = row.group && !/completed-shows$/.test(row.group) ? row.group : '';
+  const dead = row.playable === 0;
+  const base = `${channelLabel(row.channel)}${group ? ` · ${group.replace(/-/g, ' ')}` : ''}`;
   return {
     id: `${PREFIX}:ser:${row.key}`,
     type: 'series',
     name: row.title,
     poster: row.poster || '',
     posterShape: 'landscape',
-    description: `${channelLabel(row.channel)}${group ? ` · ${group.replace(/-/g, ' ')}` : ''}`,
+    description: dead ? `${base} · ⚠ episodes removed by source` : base,
     releaseInfo: channelLabel(row.channel),
   };
 }
@@ -524,7 +536,12 @@ async function catalogFromIndex(id, url, origin) {
   }
   const ch = CHANNELS.find((c) => c.id === id);
   if (!ch) return null;
-  const cards = rows.filter((r) => r.channel === ch.slug).sort(byRecent).map(rowToCard);
+  const mine = rows.filter((r) => r.channel === ch.slug);
+  // Only advertise serials whose episodes still play. The host deletes old
+  // uploads, so dead cards were exactly what made "serials links not working";
+  // if a channel has nothing verified yet, fall back to listing it all.
+  const live = mine.filter((r) => r.playable !== 0);
+  const cards = (live.length ? live : mine).sort(byRecent).map(rowToCard);
   if (!cards.length) return null;
   return { metas: cards.slice(skip, skip + PAGE) };
 }
@@ -688,8 +705,34 @@ async function handleMeta(type, id) {
 
 /* ---------------------------------------------------------------- streams */
 
+async function fetchAlive(url, ttlMs = 600000, referer = '') {
+  // Never throws: returns { ok, status, ct, body } so callers can tell a dead
+  // upload (404 / image placeholder) apart from a transport failure.
+  try {
+    const headers = {
+      'User-Agent': SITE_UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    };
+    if (referer) headers.Referer = referer;
+    const res = await fetch(url, { headers, redirect: 'follow', cf: { cacheTtl: 60 } });
+    const ct = res.headers.get('content-type') || '';
+    const body = res.ok && !/^image\//i.test(ct) ? await res.text() : '';
+    return { ok: res.ok, status: res.status, ct, body };
+  } catch (e) {
+    return { ok: false, status: 0, ct: '', body: '' };
+  }
+}
+
 async function resolveEpisodeStreams(postId, origin) {
-  const page = await fetchHtml(`${SITE}/?p=${postId}`, 10 * 60 * 1000);
+  // The source 404s episodes that were deleted; an unguarded throw here became a
+  // Cloudflare 1101 (HTTP 500) in the app, so failures must degrade to "no streams".
+  let page;
+  try {
+    page = await fetchHtml(`${SITE}/?p=${postId}`, 10 * 60 * 1000);
+  } catch (e) {
+    return { streams: [], ep: null, dead: true };
+  }
   const ep = parseEpisodePage(page);
   const players = ep.players.slice(0, 6);
   if (!players.length) return { streams: [], ep };
@@ -702,8 +745,9 @@ async function resolveEpisodeStreams(postId, origin) {
         if (!m3u8) {
           const embed = extractEmbed(html);
           if (!embed) return null;
-          const embedHtml = await fetchHtml(embed, 10 * 60 * 1000, PLAYER_REF);
-          m3u8 = extractM3u8(embedHtml);
+          const alive = await fetchAlive(embed, 10 * 60 * 1000, PLAYER_REF);
+          if (!alive.ok || /^image\//i.test(alive.ct)) return null; // host deleted the file
+          m3u8 = extractM3u8(alive.body);
         }
         return m3u8 ? { m3u8, player: p } : null;
       } catch (e) {
@@ -732,8 +776,14 @@ async function resolveEpisodeStreams(postId, origin) {
 async function handleStream(type, id, origin) {
   const postId = (id.match(/(\d+)$/) || [])[1];
   if (!postId) return json({ streams: [] }, 60);
-  const { streams } = await resolveEpisodeStreams(postId, origin);
-  return json({ streams }, 300);
+  try {
+    const { streams } = await resolveEpisodeStreams(postId, origin);
+    return json({ streams }, 300);
+  } catch (e) {
+    // Never surface a worker exception to the client: an empty list makes the
+    // app show "no streams" instead of an HTTP 500.
+    return json({ streams: [] }, 120);
+  }
 }
 
 /* ----------------------------------------------------------------- relay */
@@ -906,4 +956,5 @@ export const _test = {
   parseSeriesCards, parseEpisodes, parseEpisodePage, extractM3u8, extractEmbed,
   textVariants, titleDate, dayOfYear, uaFromToken, b64urlEncode, b64urlDecode,
   applyPathExtras, unescapeHtml, searchRows, catalogFromIndex, ARCHIVE_CHANNELS,
+  clearCache: () => MEM.clear(),
 };

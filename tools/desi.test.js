@@ -101,6 +101,7 @@ const IDX_FIXTURE = {
   },
 };
 function stubIndex(body = IDX_FIXTURE, ok = true) {
+  _test.clearCache();
   const orig = globalThis.fetch;
   globalThis.fetch = async () => ({ ok, json: async () => body });
   return () => { globalThis.fetch = orig; };
@@ -123,4 +124,49 @@ test("archive channels get no catalog row", async () => {
     assert.equal(await _test.catalogFromIndex("life-ok", new URL("https://x/desi/catalog/series/life-ok.json"), "https://x"), null);
     assert.deepEqual(_test.ARCHIVE_CHANNELS, ["life-ok", "zoo-of-all-old-shows"]);
   } finally { restore(); }
+});
+
+const PLAY_FIXTURE = {
+  shows: {
+    "star-plus~anupamaa": ["star-plus", "", "Anupamaa", null, "2026-11-12", 500, 1],
+    "star-plus~kumkum-bhagya": ["star-plus", "star-plus-completed-shows", "Kumkum Bhagya", null, "2021-03-05", 100, 0],
+    "star-plus~kabhi-kabhi": ["star-plus", "", "Kabhi Kabhi", null, "2022-01-01", 80, 1],
+  },
+};
+
+test("channel rows drop shows whose episodes were removed at the source", async () => {
+  const restore = stubIndex(PLAY_FIXTURE);
+  try {
+    const out = await _test.catalogFromIndex("star-plus", new URL("https://x/desi/catalog/series/star-plus.json"), "https://x");
+    assert.deepEqual(out.metas.map((m) => m.name), ["Anupamaa", "Kabhi Kabhi"]);
+  } finally { restore(); }
+});
+
+test("a channel with no verified show still lists everything", async () => {
+  const onlyDead = { shows: { "star-plus~kumkum-bhagya": ["star-plus", "star-plus-completed-shows", "Kumkum Bhagya", null, "2021-03-05", 100, 0] } };
+  const restore = stubIndex(onlyDead);
+  try {
+    const out = await _test.catalogFromIndex("star-plus", new URL("https://x/desi/catalog/series/star-plus.json"), "https://x");
+    assert.equal(out.metas.length, 1);
+    assert.equal(out.metas[0].name, "Kumkum Bhagya");
+  } finally { restore(); }
+});
+
+test("rows that were never probed are treated as playable", async () => {
+  const restore = stubIndex(IDX_FIXTURE);
+  try {
+    const out = await _test.catalogFromIndex("star-plus", new URL("https://x/desi/catalog/series/star-plus.json"), "https://x");
+    assert.deepEqual(out.metas.map((m) => m.name), ["Anupamaa", "Kumkum Bhagya"]);
+  } finally { restore(); }
+});
+
+test("both the modern and the legacy player endpoints are recognised", () => {
+  assert.equal(
+    _test.extractEmbed('<iframe src="https://flow.tvlogy.to/embed01/11uueklJyoJ0JRZ/"></iframe>'),
+    "https://flow.tvlogy.to/embed01/11uueklJyoJ0JRZ",
+  );
+  assert.equal(
+    _test.extractEmbed('<iframe src="https://hls.tvlogy.to/player/index.php?data=2a7724072f7899204001097c953e41c0"></iframe>'),
+    "https://hls.tvlogy.to/player/index.php?data=2a7724072f7899204001097c953e41c0",
+  );
 });
