@@ -305,7 +305,7 @@ export function desiManifest(origin) {
   ];
   return {
     id: 'org.ongserv.desiserials',
-    version: '1.2.1',
+    version: '1.2.2',
     name: 'Desi Serials',
     description:
       'Indian TV serials and daily episodes from desi-serials.to — Star Plus, Zee TV, Sony TV, Colors, Star Bharat, Sab TV and & TV.',
@@ -532,7 +532,7 @@ async function catalogFromIndex(id, url, origin) {
     const cards = q
       ? searchRows(rows, q)
       : rows.slice().sort(byRecent).map(rowToCard);
-    return { metas: cards.slice(skip, skip + PAGE) };
+    return { metas: cards.slice(skip, skip + PAGE), hasMore: skip + PAGE < cards.length };
   }
   const ch = CHANNELS.find((c) => c.id === id);
   if (!ch) return null;
@@ -543,7 +543,7 @@ async function catalogFromIndex(id, url, origin) {
   const live = mine.filter((r) => r.playable !== 0);
   const cards = (live.length ? live : mine).sort(byRecent).map(rowToCard);
   if (!cards.length) return null;
-  return { metas: cards.slice(skip, skip + PAGE) };
+  return { metas: cards.slice(skip, skip + PAGE), hasMore: skip + PAGE < cards.length };
 }
 
 async function handleCatalog(type, id, url, origin) {
