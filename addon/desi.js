@@ -305,7 +305,7 @@ export function desiManifest(origin) {
   ];
   return {
     id: 'org.ongserv.desiserials',
-    version: '1.2.0',
+    version: '1.2.1',
     name: 'Desi Serials',
     description:
       'Indian TV serials and daily episodes from desi-serials.to — Star Plus, Zee TV, Sony TV, Colors, Star Bharat, Sab TV and & TV.',
