@@ -4,7 +4,7 @@ import "../providers/framextv.js";
 import "../providers/pvrplay.js";
 import "../providers/vidlink.js";
 import { handleDesi, desiManifest } from "./desi.js";
-import { handleDesiTashan, handleDesiSeries } from "./desitashan.js";
+import { handleDesiTashan, handleDesiSeries, dssManifest } from "./desitashan.js";
 
 /**
  * PvrPlay Catalogs — a Stremio-protocol addon for Nuvio
@@ -770,9 +770,33 @@ function manifest() {
       extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
     });
   }
+
+  // Desi Tashan rows (series dashboard over the 207-show / 27k-episode index).
+  // Android Nuvio has no separate plugin slot either, so these are advertised
+  // here too. Ids keep their native `dss:` prefix; cards resolve to `dts:`
+  // meta/stream ids — the router rewrites both onto the /dss mount.
+  for (const c of dssManifest(PVR_BASE + "/dss").catalogs) {
+    catalogs.push({
+      type: c.type,
+      id: c.id,
+      name: "Desi Tashan · " + c.name,
+      extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
+    });
+  }
+
+  // CATALOGS lists a few rows twice and a duplicated type+id renders twice in
+  // Nuvio, so collapse by type+id before advertising.
+  const seen = new Set();
+  const rows = catalogs.filter((c) => {
+    const key = c.type + "|" + c.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.7.8",
+    version: "1.8.0",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -783,11 +807,11 @@ function manifest() {
       // No idPrefixes here on purpose. Nuvio rewrites a tmdb: id to an IMDb
       // id before resolving meta, then filters addons by idPrefixes — so
       // declaring "tmdb:" means this resource is never consulted.
-      { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "dser:"] }
+      { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "dser:", "dts:"] }
     ],
     types: ["movie", "series"],
-    idPrefixes: ["tmdb:", "dser:"],
-    catalogs: catalogs
+    idPrefixes: ["tmdb:", "dser:", "dts:"],
+    catalogs: rows
   };
 }
 
@@ -1113,6 +1137,15 @@ export default {
       // Desi Serials — series-only view of Desi Tashan, mounted under /dss.
       if (path === "/dss" || path.startsWith("/dss/")) {
         return handleDesiSeries(request, url, `${url.protocol}//${url.host}`);
+      }
+
+      // The same Desi Tashan rows are advertised by THIS manifest with their
+      // native `dss:` ids, whose cards carry `dts:` meta/stream ids. Rewrite
+      // both prefixes onto the /dss mount so one installed addon resolves them.
+      if (/^\/(catalog|meta|stream)\/(movie|series)\/(dss:|dts:)/.test(decodeURIComponent(path))) {
+        const u2 = new URL(url.toString());
+        u2.pathname = "/dss" + path;
+        return handleDesiSeries(request, u2, `${url.protocol}//${url.host}`);
       }
 
       if (path === "/" || path === "/manifest.json") {
