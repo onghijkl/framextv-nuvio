@@ -772,7 +772,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.7.6",
+    version: "1.7.7",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -1014,7 +1014,8 @@ async function resolveStreams(type, rawId, diag) {
           timer = setTimeout(function () { resolve([]); }, PROVIDER_TIMEOUT_MS);
         });
         const got = (await Promise.race([work, capped])) || [];
-        if (diag) diag.push({ name: p.name, streams: got.length, ms: Date.now() - started });
+        if (diag) diag.push({ name: p.name, streams: got.length, ms: Date.now() - started,
+          detail: (mod.getStreams && mod.getStreams._diag) || null });
         return { p: p, streams: got };
       } catch (e) {
         // A provider that throws must not hide the others, but a silent []

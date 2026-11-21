@@ -43,6 +43,14 @@ var VALIDATE_TIMEOUT_MS = 2500;
 // extractors normally finish (found:false) before cinemaos does.
 var COLLECT_WINDOW_MS = 1500;
 
+/* ------------------------------------------------------------- diagnostics */
+// ?debug=1 on /stream/* reads getStreams._diag to explain an empty answer: a
+// bare [] cannot tell a failed TMDB lookup from an extractor that answered with
+// nothing from sources the probe dropped.
+var DIAG = null;
+var LAST_STATUS = 0;
+function note(key, value) { if (DIAG) DIAG[key] = value; }
+
 var HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -97,6 +105,7 @@ function timedFetch(url, opts, timeoutMs) {
   return Promise.race([work, cap]).then(
     function (r) {
       if (timer) clearTimeout(timer);
+      LAST_STATUS = r ? r.status : 0;
       return r;
     },
     function (e) {
@@ -182,14 +191,17 @@ function resolveTmdbId(tmdbId, mediaType) {
       { headers: { Accept: "application/json" } }
     )
       .then(function (r) {
+        note("tmdb", r ? r.status : "no-response");
         return r && r.ok ? r.json() : null;
       })
       .then(function (d) {
         var res = d && (mediaType === "tv" ? d.tv_results : d.movie_results);
+        note("tmdbResults", res ? res.length : 0);
         if (res && res.length) return String(res[0].id);
         return null;
       })
-      .catch(function () {
+      .catch(function (e) {
+        note("tmdbError", String((e && e.message) || e));
         return null;
       });
   }
@@ -541,6 +553,7 @@ function hedgedFetchLines(url) {
 
     function settle(objs) {
       inFlight--;
+      note("primary", LAST_STATUS + " / " + objs.length + " lines");
       if (done) return;
       if (hasSource(objs) || inFlight === 0) finish(objs);
     }
@@ -584,6 +597,11 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode) {
 
   var url = PLAYER + "/api/" + endpoint + "?" + qs(params);
   var call = endpoint === EXTRACTORS[0] ? hedgedFetchLines(url) : timedFetch(url).then(readJsonLines);
+
+  if (DIAG) call = call.then(function (objs) {
+    note(endpoint, LAST_STATUS + " / " + objs.length + " obj");
+    return objs;
+  });
 
   return call
     .then(function (objs) {
@@ -763,12 +781,21 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   var season = parseInt(seasonNum, 10) || 1;
   var episode = parseInt(episodeNum, 10) || 1;
 
+  DIAG = { input: String(tmdbId), type: type, season: season, episode: episode };
+  getStreams._diag = DIAG;
+
   return resolveTmdbId(tmdbId, type)
     .then(function (id) {
+      note("resolved", id);
       if (!id) return [];
       return extract(id, type, season, episode);
     })
-    .catch(function () {
+    .then(function (out) {
+      note("kept", out.length);
+      return out;
+    })
+    .catch(function (e) {
+      note("error", String((e && e.message) || e));
       return [];
     });
 }
