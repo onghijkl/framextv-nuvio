@@ -1212,7 +1212,9 @@ async function handleCatalog(type, id, url, variant = "dts", origin = "") {
     if (e) memSet("pid:" + e[2], e[1], 6 * 60 * 60 * 1000);
   }
   const noCache = id.includes("search");
-  return json({ metas }, noCache ? 60 : 600);
+  // hasMore lets Nuvio keep paging (dss:all has 200+ shows, 20 per page).
+  const hasMore = metas.length >= PAGE_SIZE;
+  return json({ metas, hasMore }, noCache ? 60 : 600);
 }
 
 /**

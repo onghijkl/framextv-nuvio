@@ -796,7 +796,7 @@ function manifest() {
 
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.8.0",
+    version: "1.8.1",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
