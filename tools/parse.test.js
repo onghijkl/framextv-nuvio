@@ -328,6 +328,20 @@ async function main() {
     assert.strictEqual(P.withLadderLabel({ url: "u", quality: "2160p" }, small).quality, "2160p");
   });
 
+  await test("a playlist hidden behind a proxy hop is still recognised", function () {
+    // The 4K rung tends to live on a host the extractor reaches through a CORS
+    // hop — the extension sits inside ?url=, so the source used to be emitted
+    // unprobed, labelled "auto", and sorted below every 1080p entry.
+    const hop =
+      "https://frappe.hybrows.workers.dev/?origin=https%3A%2F%2Fvidly.pro&url=https%3A%2F%2Fimg.rousav.tech%2Fmedia%2F84ac0a4bc316%2Findex.m3u8";
+    assert.ok(P.embeddedHls(hop));
+    assert.strictEqual(P.isHlsSource({ url: hop }), true);
+    // A proxied plain file must stay a file — probing it changes nothing.
+    assert.strictEqual(P.embeddedHls("https://hop/?url=https%3A%2F%2Fcdn%2Fmovie.mp4"), "");
+    assert.strictEqual(P.isHlsSource({ url: "https://cdn/movie.mp4" }), false);
+    assert.ok(F.embeddedHls(hop) && V.embeddedHls(hop));
+  });
+
   await test("needsFilter only fires when some variants go and some survive", function () {
     // Both 4K ladders pass through untouched now: nothing is over 2160 and the
     // HEVC rungs are the only route to 4K, so a wrap would change nothing.

@@ -289,8 +289,29 @@ function mediaKey(url) {
 
 /* ------------------------------------------------------------- extraction */
 
+
+/**
+ * A master playlist often sits behind a CORS/proxy hop that hides the
+ * extension: .../proxy?url=https%3A%2F%2Fcdn%2Fmedia%2F<hash>%2Findex.m3u8
+ * Without this the source is never probed, arrives labelled "auto" and sorts
+ * below every 1080p entry however good the ladder actually is.
+ */
+function embeddedHls(url) {
+  var m = String(url).match(/[?&]url=([^&]+)/i);
+  if (!m) return "";
+  var t = "";
+  try {
+    t = decodeURIComponent(m[1]);
+  } catch (e) {
+    t = m[1];
+  }
+  return /\.m3u8(\?|$)/i.test(t) ? t : "";
+}
 function isHlsSource(s) {
-  return s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("ios-hls") !== -1;
+  return (
+    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("ios-hls") !== -1 ||
+    !!embeddedHls(s.url)
+  );
 }
 
 /**
@@ -405,6 +426,7 @@ function prepareSource(s) {
 
   // Strip the CORS-only relay hop before validating, so the link we emit is the
   // short form and the media target is what actually appears in the URL.
+  var embedded = embeddedHls(s.url);
   var direct = unwrapProxy(s.url);
   if (direct !== s.url) {
     var copy = {};
@@ -415,10 +437,10 @@ function prepareSource(s) {
 
   return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
     .then(function (r) {
-      if (!r) return s.verified ? s : null;
-      if (!r.ok) return null;
+      if (!r) return embedded || s.verified ? s : null;
+      if (!r.ok) return embedded ? s : null;
       return r.text().then(function (t) {
-        if (t.indexOf("#EXTM3U") === -1) return null;
+        if (t.indexOf("#EXTM3U") === -1) return embedded ? s : null;
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
         if (isMaster) s = withLadderLabel(s, t);
         if (!isMaster && t.indexOf("#EXTINF") === -1) return null;
@@ -437,7 +459,7 @@ function prepareSource(s) {
     })
     .catch(function () {
       // Timeout / network blip: the extractor already verified it.
-      return s.verified ? s : null;
+      return embedded || s.verified ? s : null;
     });
 }
 
@@ -776,6 +798,8 @@ if (typeof module !== "undefined" && module.exports) {
       mediaKey: mediaKey,
       collapseTrackQuality: collapseTrackQuality,
       ladderTop: ladderTop,
+      embeddedHls: embeddedHls,
+      isHlsSource: isHlsSource,
       withLadderLabel: withLadderLabel,
       dropHevc: dropHevc,
       avcCeiling: avcCeiling

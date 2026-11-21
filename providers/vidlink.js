@@ -197,20 +197,41 @@ function needsFilter(text) {
   return dropped > 0 && kept > 0;
 }
 
-function prepareSource(s) {
+
+/**
+ * A master playlist often sits behind a CORS/proxy hop that hides the
+ * extension: .../proxy?url=https%3A%2F%2Fcdn%2Fmedia%2F<hash>%2Findex.m3u8
+ * Without this the source is never probed, arrives labelled "auto" and sorts
+ * below every 1080p entry however good the ladder actually is.
+ */
+function embeddedHls(url) {
+  var m = String(url).match(/[?&]url=([^&]+)/i);
+  if (!m) return "";
+  var t = "";
+  try {
+    t = decodeURIComponent(m[1]);
+  } catch (e) {
+    t = m[1];
+  }
+  return /\.m3u8(\?|$)/i.test(t) ? t : "";
+}
+
+
+/* ----------function prepareSource(s) {
+  var embedded = embeddedHls(s.url); // probe failures must not drop these
   var isHls =
-    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url);
+    s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || !!embedded;
 
   if (!isHls) return Promise.resolve(s);
 
   return timedFetch(s.url, null, VALIDATE_TIMEOUT_MS)
     .then(function (r) {
-      if (!r || !r.ok) return null;
+      if (!r || !r.ok) return embedded ? s : null;
       return r.text().then(function (t) {
-        if (t.indexOf("#EXTM3U") === -1) return null; // an error page, not a playlist
+        if (t.indexOf("#EXTM3U") === -1) return embedded ? s : null; // an error page, not a playlist
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
         if (isMaster) s = withLadderLabel(s, t);
-        if (!isMaster && t.indexOf("#EXTINF") === -1) return null;
+        if (!isMaster && t.indexOf("#EXTINF") === -1) return embedded ? s : null;
 
         if (isMaster && needsFilter(t)) {
           return {
@@ -227,11 +248,9 @@ function prepareSource(s) {
       });
     })
     .catch(function () {
-      return null;
+      return embedded ? s : null;
     });
-}
-
-/* -------------------------------------------------------------- extraction */
+}---------------------------------------------------- extraction */
 
 function resolveTmdbId(tmdbId, mediaType) {
   var raw = String(tmdbId == null ? "" : tmdbId).trim();
@@ -410,6 +429,7 @@ if (typeof module !== "undefined" && module.exports) {
       qualityRank: qualityRank,
       labelFor: labelFor,
       ladderTop: ladderTop,
+      embeddedHls: embeddedHls,
       withLadderLabel: withLadderLabel,
       dropHevc: dropHevc,
       avcCeiling: avcCeiling
