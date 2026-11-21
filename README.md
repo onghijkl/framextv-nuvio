@@ -82,8 +82,15 @@ when an upstream site moves.
    decisive existence check — the search index covers all of TMDB and so
    proves nothing on its own.
 5. Each candidate source is fetched once to drop dead links, and a master
-   advertising HEVC or an over-cap rendition is routed through the playlist
-   filter in `addon/worker.js`.
+   advertising an over-cap rendition or a redundant HEVC one is routed through
+   the playlist filter in `addon/worker.js`. The cap is **2160 / 40 Mbps**
+   (`cap` / `maxbw` on `/hls`, `getStreams.maxHeight` / `maxBitrate`
+   otherwise), so a real 4K rung survives. HEVC is dropped only when an AVC
+   variant already reaches the same height — otherwise it is the only way to
+   reach that resolution. `/hls?...&codec=avc` restores the old always-drop
+   behaviour, `codec=any` keeps HEVC unconditionally. Sources are labelled from
+   their own ladder (`ladderTop`), so a 4K master no longer arrives as "Auto"
+   and sorts below every 1080p entry.
 
 ### Runtime limits
 

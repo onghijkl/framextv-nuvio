@@ -335,7 +335,7 @@ async function metasFor(items, type) {
  * Only the small playlist passes through here; segments are fetched by the
  * player straight from the origin.
  */
-async function filterPlaylist(target, cap, maxBw) {
+async function filterPlaylist(target, cap, maxBw, codecPolicy) {
   const res = await fetch(target, {
     headers: { "User-Agent": UA },
     cf: { cacheTtl: 300, cacheEverything: true }
@@ -375,6 +375,21 @@ async function filterPlaylist(target, cap, maxBw) {
   let kept = 0;
   let dropped = 0;
 
+  // Tallest non-HEVC variant in the ladder. Used to decide whether an HEVC
+  // rendition is redundant or load-bearing — see the `hevc` check below.
+  let avcTop = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    const cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    if (/hvc1|hev1/i.test(cod)) continue;
+    const r = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    const h = r ? parseInt(r[2], 10) : 0;
+    if (h > avcTop) avcTop = h;
+  }
+
+  const policy = codecPolicy || "auto";
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
@@ -404,7 +419,13 @@ async function filterPlaylist(target, cap, maxBw) {
     const res2 = line.match(/RESOLUTION=(\d+)x(\d+)/);
     const height = res2 ? parseInt(res2[2], 10) : 0;
     const codecs = (line.match(/CODECS="([^"]+)"/) || [])[1] || "";
-    const hevc = /hvc1|hev1/i.test(codecs);
+    // Codec policy. "auto" (default) drops an HEVC rendition only when an AVC
+    // variant of the same height or taller exists — otherwise it is the only
+    // route to that resolution, and 4K ladders are frequently HEVC-only.
+    // "any" keeps HEVC always, "avc" restores the old always-drop behaviour.
+    const isHevc = /hvc1|hev1/i.test(codecs);
+    const hevc =
+      isHevc && (policy === "any" ? false : policy === "avc" ? true : avcTop >= height || !height);
     const tooTall = height && height > cap;
     // A bitrate ceiling as well: some ladders advertise a wide but short
     // variant that slips under the height cap and then buffers hard.
@@ -751,7 +772,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.7.3",
+    version: "1.7.4",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -1114,17 +1135,20 @@ export default {
         return cors(JSON.stringify(data));
       }
 
-      // /hls?u=<encoded master playlist>&cap=1080
+      // /hls?u=<encoded master playlist>&cap=2160&maxbw=40000000&codec=auto
+      // Defaults are 4K-friendly: capping at 1080 / 12 Mbps silently cut the
+      // 3840x2160 rungs off ladders that do carry them.
       if (path === "/hls") {
         const target = url.searchParams.get("u");
-        const cap = parseInt(url.searchParams.get("cap") || "1080", 10) || 1080;
-        const maxBw = parseInt(url.searchParams.get("maxbw") || "12000000", 10) || 12000000;
+        const cap = parseInt(url.searchParams.get("cap") || "2160", 10) || 2160;
+        const maxBw = parseInt(url.searchParams.get("maxbw") || "40000000", 10) || 40000000;
+        const codec = url.searchParams.get("codec") || "auto";
         if (!target) return cors(JSON.stringify({ error: "missing u" }), 400);
 
         const refusal = hlsTargetRefusal(target, env);
         if (refusal) return cors(JSON.stringify({ error: refusal }), 403);
 
-        const filtered = await filterPlaylist(target, cap, maxBw);
+        const filtered = await filterPlaylist(target, cap, maxBw, codec);
         if (filtered === null) {
           return new Response("upstream playlist unavailable", { status: 502 });
         }

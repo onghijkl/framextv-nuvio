@@ -298,6 +298,71 @@ function isHlsSource(s) {
 }
 
 /**
+ * Height of the tallest non-HEVC (AVC) variant in a master playlist.
+ *
+ * An HEVC rendition is dropped when an AVC variant of the same height is
+ * available (some players render HEVC as audio-only), but kept when it is the
+ * only route to that resolution: 4K ladders are frequently HEVC-only, so
+ * dropping them unconditionally is what pins playback to 1080p.
+ */
+function avcCeiling(lines) {
+  var top = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i];
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    if (/hvc1|hev1/i.test(cod)) continue;
+    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    var h = res ? parseInt(res[2], 10) : 0;
+    if (h > top) top = h;
+  }
+  return top;
+}
+
+/** Drop this variant for codec reasons? policy: "auto" | "any" | "avc". */
+function dropHevc(policy, codecs, height, avcTop) {
+  if (!/hvc1|hev1/i.test(codecs)) return false;
+  if (policy === "any") return false; // player handles HEVC - keep 4K HEVC
+  if (policy === "avc") return true; // never offer HEVC (previous behaviour)
+  return avcTop >= height || !height;
+}
+
+/** Tallest variant that survives the filter - i.e. what will really play. */
+function ladderTop(lines) {
+  var cap = getStreams.maxHeight || 2160;
+  var maxBw = getStreams.maxBitrate || 40000000;
+  var policy = getStreams.codecPolicy || "auto";
+  var avcTop = avcCeiling(lines);
+  var top = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i];
+    if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+    var res = l.match(/RESOLUTION=(\d+)x(\d+)/);
+    var h = res ? parseInt(res[2], 10) : 0;
+    if (!h) continue;
+    var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
+    var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
+    if (dropHevc(policy, cod, h, avcTop) || h > cap || (bw && bw > maxBw)) continue;
+    if (h > top) top = h;
+  }
+  return top;
+}
+
+/**
+ * Advertise the quality the source will actually deliver. Upstream labels 4K
+ * masters "auto", and the stream list is sorted by that label, so without this
+ * a real 4K source ranks below every 1080p entry.
+ */
+function withLadderLabel(s, text) {
+  var top = ladderTop(text.split("\n"));
+  if (!top || qualityRank(top + "p") <= qualityRank(s.quality)) return s;
+  var copy = {};
+  for (var k in s) copy[k] = s[k];
+  copy.quality = top + "p";
+  return copy;
+}
+
+/**
  * Would the playlist filter actually change anything?
  *
  * Only when some variants must go (HEVC, over the height or bitrate cap) AND
@@ -305,11 +370,13 @@ function isHlsSource(s) {
  * keeps every variant anyway, so routing through it was a pointless extra hop.
  */
 function needsFilter(text) {
-  var cap = getStreams.maxHeight || 1080;
-  var maxBw = getStreams.maxBitrate || 12000000;
+  var cap = getStreams.maxHeight || 2160;
+  var maxBw = getStreams.maxBitrate || 40000000;
+  var policy = getStreams.codecPolicy || "auto";
   var kept = 0;
   var dropped = 0;
   var lines = text.split("\n");
+  var avcTop = avcCeiling(lines);
   for (var i = 0; i < lines.length; i++) {
     var l = lines[i];
     if (l.indexOf("#EXT-X-STREAM-INF") !== 0) continue;
@@ -317,7 +384,7 @@ function needsFilter(text) {
     var h = res ? parseInt(res[2], 10) : 0;
     var cod = (l.match(/CODECS="([^"]+)"/) || [])[1] || "";
     var bw = parseInt((l.match(/BANDWIDTH=(\d+)/) || [])[1] || "0", 10);
-    if (/hvc1|hev1/i.test(cod) || (h && h > cap) || (bw && bw > maxBw)) dropped++;
+    if (dropHevc(policy, cod, h, avcTop) || (h && h > cap) || (bw && bw > maxBw)) dropped++;
     else kept++;
   }
   return dropped > 0 && kept > 0;
@@ -357,14 +424,16 @@ function prepareSource(s) {
       return r.text().then(function (t) {
         if (t.indexOf("#EXTM3U") === -1) return null;
         var isMaster = t.indexOf("#EXT-X-STREAM-INF") !== -1;
+        if (isMaster) s = withLadderLabel(s, t);
         if (!isMaster && t.indexOf("#EXTINF") === -1) return null;
         if (isMaster && needsFilter(t)) {
           var copy = {};
           for (var k in s) copy[k] = s[k];
           copy.url = (getStreams.filterBase || FILTER_BASE) +
             "/hls?u=" + encodeURIComponent(s.url) +
-            "&cap=" + (getStreams.maxHeight || 1080) +
-            "&maxbw=" + (getStreams.maxBitrate || 12000000);
+            "&cap=" + (getStreams.maxHeight || 2160) +
+            "&maxbw=" + (getStreams.maxBitrate || 40000000) +
+            (getStreams.codecPolicy ? "&codec=" + getStreams.codecPolicy : "");
           return copy;
         }
         return s;
@@ -686,8 +755,10 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
     });
 }
 
-getStreams.maxHeight = 1080;
-getStreams.maxBitrate = 12000000;
+getStreams.maxHeight = 2160;
+getStreams.maxBitrate = 40000000;
+// "auto": HEVC only when it is the sole route to a resolution (see dropHevc).
+getStreams.codecPolicy = "auto";
 getStreams.filterBase = FILTER_BASE;
 getStreams.preferredLanguages = ["English", "Hindi"];
 getStreams.maxResults = 0; // 0 = no cap
@@ -707,7 +778,11 @@ if (typeof module !== "undefined" && module.exports) {
       languageOf: languageOf,
       unwrapProxy: unwrapProxy,
       mediaKey: mediaKey,
-      collapseTrackQuality: collapseTrackQuality
+      collapseTrackQuality: collapseTrackQuality,
+      ladderTop: ladderTop,
+      withLadderLabel: withLadderLabel,
+      dropHevc: dropHevc,
+      avcCeiling: avcCeiling
     }
   };
 } else if (typeof global !== "undefined") {

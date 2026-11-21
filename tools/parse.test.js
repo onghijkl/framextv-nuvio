@@ -61,6 +61,32 @@ const MASTER_ALL_HEVC = [
   ""
 ].join("\n");
 
+// A ladder that genuinely carries 4K over AVC — the shape the Worker used to
+// truncate back to 1080p, both because cap defaulted to 1080 and because the
+// 4K rung is over the old 12 Mbps bitrate ceiling.
+const MASTER_AVC_4K = [
+  "#EXTM3U",
+  '#EXT-X-STREAM-INF:BANDWIDTH=15400000,RESOLUTION=3840x2160,CODECS="avc1.640033,mp4a.40.2"',
+  "4k/index.m3u8",
+  '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"',
+  "1080/index.m3u8",
+  '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"',
+  "720/index.m3u8",
+  ""
+].join("\n");
+
+// 4K over both codecs: here the HEVC rung is redundant, so it still goes.
+const MASTER_HEVC_REDUNDANT = [
+  "#EXTM3U",
+  '#EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.1.6.L153"',
+  "4k-hevc/index.m3u8",
+  '#EXT-X-STREAM-INF:BANDWIDTH=22000000,RESOLUTION=3840x2160,CODECS="avc1.640033"',
+  "4k-avc/index.m3u8",
+  '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.640028"',
+  "1080/index.m3u8",
+  ""
+].join("\n");
+
 const MEDIA_PLAYLIST = [
   "#EXTM3U",
   "#EXT-X-TARGETDURATION:6",
@@ -244,10 +270,72 @@ async function main() {
     assert.strictEqual(objs[0].source.url, "https://a/1.m3u8");
   });
 
+  // The 4K path. Two separate knobs used to cut the 3840x2160 rung off a
+  // ladder that really carries it — the 1080 height cap and the 12 Mbps
+  // bitrate ceiling — and a third (HEVC) cut it whenever the 4K rung was
+  // HEVC-only, which on real ladders is the common case.
+  await test("filterPlaylist keeps a real 4K rung at the 2160 / 40 Mbps defaults", async function () {
+    stubFetch(MASTER_AVC_4K);
+    const out = await W.filterPlaylist(TARGET, 2160, 40000000);
+    assert.ok(out.indexOf("4k/index.m3u8") !== -1, "4K rung dropped");
+    assert.ok(out.indexOf("1080/index.m3u8") !== -1);
+    assert.ok(out.indexOf("720/index.m3u8") !== -1);
+  });
+
+  await test("both old caps were truncating 4K on their own", async function () {
+    stubFetch(MASTER_AVC_4K);
+    const byHeight = await W.filterPlaylist(TARGET, 1080, 40000000);
+    assert.strictEqual(byHeight.indexOf("4k/index.m3u8"), -1);
+    assert.ok(byHeight.indexOf("1080/index.m3u8") !== -1);
+
+    stubFetch(MASTER_AVC_4K);
+    const byRate = await W.filterPlaylist(TARGET, 2160, 12000000);
+    assert.strictEqual(byRate.indexOf("4k/index.m3u8"), -1, "15.4 Mbps rung survived the old ceiling");
+  });
+
+  await test("an HEVC rung is dropped only when AVC already reaches that height", async function () {
+    stubFetch(MASTER_MIXED);
+    const kept = await W.filterPlaylist(TARGET, 2160, 40000000);
+    assert.ok(kept.indexOf("4k/index.m3u8") !== -1, "HEVC-only 4K must survive");
+
+    stubFetch(MASTER_HEVC_REDUNDANT);
+    const redundant = await W.filterPlaylist(TARGET, 2160, 40000000);
+    assert.strictEqual(redundant.indexOf("4k-hevc/index.m3u8"), -1);
+    assert.ok(redundant.indexOf("4k-avc/index.m3u8") !== -1);
+  });
+
+  await test("codec=avc restores the old always-drop, codec=any keeps everything", async function () {
+    stubFetch(MASTER_MIXED);
+    const avc = await W.filterPlaylist(TARGET, 2160, 40000000, "avc");
+    assert.strictEqual(avc.indexOf("4k/index.m3u8"), -1);
+
+    stubFetch(MASTER_HEVC_REDUNDANT);
+    const any = await W.filterPlaylist(TARGET, 2160, 40000000, "any");
+    assert.ok(any.indexOf("4k-hevc/index.m3u8") !== -1);
+  });
+
+  await test("a 4K ladder is labelled, so it stops sorting like \"Auto\"", function () {
+    assert.strictEqual(P.ladderTop(MASTER_AVC_4K.split("\n")), 2160);
+    const relabelled = P.withLadderLabel({ url: "u", quality: "auto" }, MASTER_AVC_4K);
+    assert.strictEqual(relabelled.quality, "2160p");
+    assert.ok(P.qualityRank(relabelled.quality) > P.qualityRank("1080p"));
+    // A label upstream already got right is left alone, and a stream the
+    // upstream rated higher is never downgraded by our own measurement.
+    assert.strictEqual(P.withLadderLabel({ url: "u", quality: "2160p" }, MASTER_AVC_4K).quality, "2160p");
+    assert.strictEqual(P.withLadderLabel({ url: "u", quality: "4K" }, MASTER_AVC_4K).quality, "4K");
+    const small = ['#EXTM3U', '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080', "1080/index.m3u8", ""].join("\n");
+    assert.strictEqual(P.withLadderLabel({ url: "u", quality: "auto" }, small).quality, "1080p");
+    assert.strictEqual(P.withLadderLabel({ url: "u", quality: "2160p" }, small).quality, "2160p");
+  });
+
   await test("needsFilter only fires when some variants go and some survive", function () {
-    assert.strictEqual(P.needsFilter(MASTER_MIXED), true);
-    // Every variant is HEVC: the Worker would keep them all, so the hop is pointless.
+    // Both 4K ladders pass through untouched now: nothing is over 2160 and the
+    // HEVC rungs are the only route to 4K, so a wrap would change nothing.
+    assert.strictEqual(P.needsFilter(MASTER_MIXED), false);
+    assert.strictEqual(P.needsFilter(MASTER_AVC_4K), false);
     assert.strictEqual(P.needsFilter(MASTER_ALL_HEVC), false);
+    // A redundant HEVC rung is the case the hop still exists for.
+    assert.strictEqual(P.needsFilter(MASTER_HEVC_REDUNDANT), true);
     assert.strictEqual(P.needsFilter(MEDIA_PLAYLIST), false);
   });
 
@@ -325,7 +413,9 @@ async function main() {
     // ignored the bitrate cap, pvrplay required a survivor. Same input, same
     // answer, or a fix to one keeps missing the other two.
     [
-      [MASTER_MIXED, true, "mixed ladder"],
+      [MASTER_MIXED, false, "mixed ladder"],
+      [MASTER_AVC_4K, false, "4K AVC ladder"],
+      [MASTER_HEVC_REDUNDANT, true, "redundant HEVC ladder"],
       [MASTER_ALL_HEVC, false, "all-HEVC ladder"],
       [MEDIA_PLAYLIST, false, "media playlist"]
     ].forEach(function (row) {
