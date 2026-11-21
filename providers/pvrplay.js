@@ -55,6 +55,19 @@ var DIAG = null;
 var LAST_STATUS = 0;
 function note(key, value) { if (DIAG) DIAG[key] = value; }
 
+// The extractor's edge answers 403 to bare server-to-server calls on the
+// /api/*-extract paths, so every extractor request carries browser-shaped
+// headers. Playback paths (/api/ios-hls/...) are served either way.
+var EXTRACT_OPTS = {
+  headers: {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": PLAYER + "/",
+    "Origin": PLAYER
+  }
+};
+
 var HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -158,7 +171,17 @@ function parseLoose(t) {
  * Returns an array of parsed objects.
  */
 function readJsonLines(res) {
-  if (!res || !res.ok) return Promise.resolve([]);
+  if (!res || !res.ok) {
+    // Keep the reason: a 403 from the extractor's edge is not the same thing
+    // as an extractor that answered with no sources.
+    if (DIAG && res) {
+      return res.text().then(function (t) {
+        note("lastBody", res.status + " " + String(t).slice(0, 220));
+        return [];
+      });
+    }
+    return Promise.resolve([]);
+  }
   return res
     .text()
     .then(function (t) {
@@ -578,7 +601,7 @@ function hedgedFetchLines(url) {
     function fire() {
       attempts++;
       inFlight++;
-      timedFetch(url, null, EXTRACT_TIMEOUT_MS)
+      timedFetch(url, EXTRACT_OPTS, EXTRACT_TIMEOUT_MS)
         .then(readJsonLines)
         .then(settle, failed);
     }
@@ -600,7 +623,7 @@ function tryExtractor(endpoint, tmdbId, mediaType, season, episode) {
   }
 
   var url = PLAYER + "/api/" + endpoint + "?" + qs(params);
-  var call = endpoint === EXTRACTORS[0] ? hedgedFetchLines(url) : timedFetch(url).then(readJsonLines);
+  var call = endpoint === EXTRACTORS[0] ? hedgedFetchLines(url) : timedFetch(url, EXTRACT_OPTS).then(readJsonLines);
 
   if (DIAG) call = call.then(function (objs) {
     note(endpoint, LAST_STATUS + " / " + objs.length + " obj");
