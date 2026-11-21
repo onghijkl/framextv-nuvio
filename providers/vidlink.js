@@ -217,7 +217,7 @@ function embeddedHls(url) {
 }
 
 
-/* ----------function prepareSource(s) {
+function prepareSource(s) {
   var embedded = embeddedHls(s.url); // probe failures must not drop these
   var isHls =
     s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || !!embedded;
@@ -250,7 +250,9 @@ function embeddedHls(url) {
     .catch(function () {
       return embedded ? s : null;
     });
-}---------------------------------------------------- extraction */
+}
+
+/* -------------------------------------------------------------- extraction */
 
 function resolveTmdbId(tmdbId, mediaType) {
   var raw = String(tmdbId == null ? "" : tmdbId).trim();

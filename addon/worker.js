@@ -772,7 +772,7 @@ function manifest() {
   }
   return {
     id: "org.ong.pvrplay.catalogs",
-    version: "1.7.5",
+    version: "1.7.6",
     name: "PvrPlay Catalogs",
     logo: PVR_BASE + "/pvrplay-icon.png",
     description:
@@ -969,7 +969,7 @@ async function catalog(type, id, extra) {
 // provider must not drag the whole response past that.
 const PROVIDER_TIMEOUT_MS = 8000;
 
-async function resolveStreams(type, rawId) {
+async function resolveStreams(type, rawId, diag) {
   let id = rawId;
   let season = null;
   let episode = null;
@@ -993,8 +993,12 @@ async function resolveStreams(type, rawId) {
   // doing them in sequence meant the slowest one set the response time.
   const results = await Promise.all(
     providers.map(async function (p) {
+      const started = Date.now();
       const mod = globalThis[p.global];
-      if (!mod || typeof mod.getStreams !== "function") return { p: p, streams: [] };
+      if (!mod || typeof mod.getStreams !== "function") {
+        if (diag) diag.push({ name: p.name, missing: true });
+        return { p: p, streams: [] };
+      }
       // Cap each provider: one slow upstream should not hold the whole
       // response past what a Stremio client will wait for.
       let timer = null;
@@ -1009,8 +1013,13 @@ async function resolveStreams(type, rawId) {
         const capped = new Promise(function (resolve) {
           timer = setTimeout(function () { resolve([]); }, PROVIDER_TIMEOUT_MS);
         });
-        return { p: p, streams: (await Promise.race([work, capped])) || [] };
+        const got = (await Promise.race([work, capped])) || [];
+        if (diag) diag.push({ name: p.name, streams: got.length, ms: Date.now() - started });
+        return { p: p, streams: got };
       } catch (e) {
+        // A provider that throws must not hide the others, but a silent []
+        // is indistinguishable from "no sources upstream" — record it.
+        if (diag) diag.push({ name: p.name, error: String((e && e.message) || e), ms: Date.now() - started });
         return { p: p, streams: [] };
       } finally {
         if (timer) clearTimeout(timer);
@@ -1113,9 +1122,13 @@ export default {
       // number; for series Stremio appends :season:episode.
       const str = applyPathExtras(url, path).match(/^\/stream\/([^/]+)\/(.+)\.json$/);
       if (str) {
-        const streams = await resolveStreams(str[1], decodeURIComponent(str[2]));
+        // ?debug=1 reports what each provider actually returned; a bare empty
+        // list cannot tell a dead upstream from a throwing provider.
+        const diag = url.searchParams.get("debug") === "1" ? [] : null;
+        const streams = await resolveStreams(str[1], decodeURIComponent(str[2]), diag);
         // Signed URLs expire, so cache only briefly; never cache an empty answer.
-        const resp = cors(JSON.stringify({ streams: streams }));
+        const body = diag ? { streams: streams, _debug: diag } : { streams: streams };
+        const resp = cors(JSON.stringify(body));
         resp.headers.set("Cache-Control", streams.length ? "public, max-age=300" : "no-store");
         return resp;
       }

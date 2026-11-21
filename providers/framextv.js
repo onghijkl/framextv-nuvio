@@ -238,17 +238,6 @@ function fetchSubtitles(tmdbId, mediaType, season, episode) {
 }
 
 /**
- * Validate one source and reduce it to something playable.
- *
- * Two jobs:
- *   1. Drop sources that do not answer. The upstream API lists sources that are
- *      simply dead, and handing one to the player is what makes playback sit
- *      there before falling back.
- *   2. For HLS, hand back a single suitable variant rather than the master.
- *
- * Returns the adjusted source, or null to discard it.
- */
-/**
  * Height of the tallest non-HEVC (AVC) variant in a master playlist.
  *
  * An HEVC rendition is dropped when an AVC variant of the same height is
@@ -382,7 +371,26 @@ function embeddedHls(url) {
 
 
 /**
- * Fire a second identical request if tfunction prepareSource(s) {
+ * Validate one source and reduce it to something playable.
+ *
+ * Three jobs:
+ *   1. Drop sources that do not answer. Upstream lists sources that are simply
+ *      dead, and handing one to the player is what makes playback sit there
+ *      before falling back.
+ *   2. Drop responses that are not really playlists (CDNs return error pages
+ *      with a playlist-ish content type).
+ *   3. When a master advertises HEVC or >cap renditions, route it through the
+ *      playlist filter.
+ *
+ * Note on why the master is not simply replaced by one variant: these ladders
+ * declare audio as a separate rendition (`#EXT-X-MEDIA:TYPE=AUDIO`) referenced
+ * by `AUDIO="..."` on each variant. A variant playlist fetched on its own has no
+ * audio reference, so the result plays silently. The master has to be kept and
+ * filtered instead.
+ *
+ * Returns the adjusted source, or null to discard it.
+ */
+function prepareSource(s) {
   var embedded = embeddedHls(s.url); // probe failures must not drop these
   var isHls =
     s.type === "hls" || /\.m3u8(\?|$)/i.test(s.url) || s.url.indexOf("index-s") !== -1 ||
@@ -416,7 +424,10 @@ function embeddedHls(url) {
     .catch(function () {
       return embedded ? s : null; // dead or too slow — unless it came via a hidden hop
     });
-}he first has not answered quickly, and
+}
+
+/**
+ * Fire a second identical request if the first has not answered quickly, and
  * take whichever succeeds first.
  *
  * The frameXTV API intermittently stalls: measured directly, one call hangs for
